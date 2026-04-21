@@ -2247,6 +2247,139 @@ class QQSearchProvider(BaseSearchProvider):
             )
 
 
+class BaiduFinanceSearchProvider(BaseSearchProvider):
+    """百度财经个股新闻搜索（免费，无需 API Key）
+
+    通过百度财经 ``finance.pae.baidu.com`` 接口获取个股新闻资讯，
+    仅支持 A 股。
+    """
+
+    _BAIDU_API_URL = "https://finance.pae.baidu.com/vapi/sentimentlist"
+    _STOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
+
+    def __init__(self):
+        super().__init__(api_keys=["baidu_free"], name="BaiduFinance")
+
+    @property
+    def is_available(self) -> bool:
+        """百度财经接口免费，始终可用"""
+        return True
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
+        """Base class contract — delegates to ``search``."""
+        return self.search(query, max_results=max_results, days=days)
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
+        """搜索新闻
+
+        从查询字符串中提取 6 位股票代码，调用百度财经接口获取个股新闻，
+        并转换为统一的 SearchResult 列表。
+        """
+        match = self._STOCK_CODE_RE.search(query)
+        if not match:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="BaiduFinance: 无法从查询中提取股票代码",
+            )
+
+        stock_code = match.group(1)
+
+        try:
+            resp = _get_with_retry(
+                self._BAIDU_API_URL,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/91.0.4472.124 Safari/537.36"
+                    ),
+                    "Referer": "https://finance.pae.baidu.com/",
+                },
+                params={
+                    "market": "ab",
+                    "code": stock_code,
+                    "query": stock_code,
+                    "financeType": "stock",
+                    "pn": 0,
+                    "rn": max_results * 2,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # 解析嵌套 JSON: Result[0].TplData.aiSentimentXcxListInfo.sentimentListInfo
+            result_list = (
+                data.get("Result", [{}])[0]
+                .get("TplData", {})
+                .get("aiSentimentXcxListInfo", {})
+                .get("sentimentListInfo", [])
+            )
+
+            if not result_list:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=True,
+                )
+
+            cutoff = datetime.now() - timedelta(days=days)
+            results: List[SearchResult] = []
+
+            for item in result_list:
+                # 解析发布时间（Unix 时间戳）并过滤过期新闻
+                publish_time = item.get("publishTime", 0)
+                published_date = ""
+                if publish_time:
+                    try:
+                        dt = datetime.fromtimestamp(int(publish_time))
+                        if dt < cutoff:
+                            continue
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, OSError):
+                        pass
+
+                # benefitType 标注: 1=利好, 0=中性, -1=利空
+                benefit = item.get("benefitType", 0)
+                benefit_tag = {1: "【利好】", -1: "【利空】"}.get(benefit, "")
+
+                title = item.get("title", "")
+                abstract = item.get("abstract", "")
+                snippet = f"{benefit_tag}{abstract}" if benefit_tag else abstract
+
+                results.append(SearchResult(
+                    title=title,
+                    snippet=snippet[:1500],
+                    url=item.get("originUrl", ""),
+                    source=item.get("provider", ""),
+                    published_date=published_date,
+                ))
+
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(
+                query=query,
+                results=results,
+                provider=self._name,
+                success=True,
+            )
+
+        except Exception as e:
+            logger.error("[BaiduFinance] 搜索失败: %s", e)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=str(e),
+            )
+
+
 class AkshareNewsProvider(BaseSearchProvider):
     """Akshare 东方财富个股新闻搜索（免费，无需 API Key）
 
@@ -2410,7 +2543,8 @@ class SearchService:
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
         qq_finance_enabled: bool = False,
-        akshare_news_enabled: bool = True,
+        akshare_news_enabled: bool = False,
+        baidu_finance_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2428,6 +2562,7 @@ class SearchService:
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             qq_finance_enabled: 是否启用腾讯财经个股新闻（免费，仅 A 股）
             akshare_news_enabled: 是否启用 akshare 东方财富个股新闻（免费，仅 A 股）
+            baidu_finance_enabled: 是否启用百度财经个股新闻（免费，仅 A 股）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2501,6 +2636,11 @@ class SearchService:
         if akshare_news_enabled:
             self._providers.append(AkshareNewsProvider())
             logger.info("已启用 akshare 东方财富个股新闻")
+
+        # 10. BaiduFinance（百度财经个股新闻，免费，仅 A 股有效）
+        if baidu_finance_enabled:
+            self._providers.append(BaiduFinanceSearchProvider())
+            logger.info("已启用百度财经(BaiduFinance)个股新闻")
 
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
@@ -3741,7 +3881,8 @@ def get_search_service() -> SearchService:
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     qq_finance_enabled=getattr(config, "qq_finance_enabled", False),
-                    akshare_news_enabled=getattr(config, "akshare_news_enabled", True),
+                    akshare_news_enabled=getattr(config, "akshare_news_enabled", False),
+                    baidu_finance_enabled=getattr(config, "baidu_finance_enabled", False),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
