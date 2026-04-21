@@ -12,7 +12,9 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import os
 import re
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -22,6 +24,16 @@ from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
 from urllib.parse import parse_qsl, unquote, urlparse
+import akshare as ak
+import json
+
+
+# 确保 data_provider 等顶层包在直接运行本文件时也可导入
+if __name__ == "__main__":
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
 import requests
 from newspaper import Article, Config
 from tenacity import (
@@ -2082,6 +2094,276 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class QQSearchProvider(BaseSearchProvider):
+    """腾讯财经个股新闻搜索（免费，无需 API Key）
+
+    通过腾讯财经接口直接获取个股相关新闻资讯，并对每条新闻的 URL
+    进行正文爬取以丰富摘要内容。
+
+    Endpoint:
+        https://proxy.finance.qq.com/cgi/cgi-bin/news/info/news?symbol=sz002497
+    """
+
+    _QQ_API_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/news/info/news"
+    _STOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
+
+    def __init__(self):
+        super().__init__(api_keys=["qq_free"], name="QQFinance")
+
+    @property
+    def is_available(self) -> bool:
+        """QQ Finance API 免费，始终可用"""
+        return True
+
+    @staticmethod
+    def _convert_symbol(stock_code: str) -> str:
+        """将 A 股代码转换为腾讯财经 symbol 格式
+
+        Examples:
+            002497 -> sz002497
+            600519 -> sh600519
+            300389 -> sz300389
+        """
+        code = stock_code.strip()
+        if code.startswith(('6', '9')):
+            return f"sh{code}"
+        elif code.startswith(('0', '2', '3')):
+            return f"sz{code}"
+        elif code.startswith(('8', '4')):
+            return f"bj{code}"
+        return code
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
+        """Base class contract — delegates to ``search``."""
+        return self.search(query, max_results=max_results, days=days)
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
+        """搜索新闻
+
+        从查询字符串中提取 6 位股票代码，调用腾讯财经 API 获取个股新闻，
+        并对返回的每条新闻 URL 进行正文爬取以补充摘要。
+        """
+        # 从查询文本中提取股票代码
+        match = self._STOCK_CODE_RE.search(query)
+        if not match:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="QQFinance: 无法从查询中提取股票代码",
+            )
+
+        stock_code = match.group(1)
+        symbol = self._convert_symbol(stock_code)
+
+        try:
+            resp = _get_with_retry(
+                self._QQ_API_URL,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/91.0.4472.124 Safari/537.36"
+                    ),
+                    "Referer": "https://gu.qq.com/",
+                },
+                params={"symbol": symbol},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("code") != 0:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=False,
+                    error_message=f"QQ API 错误: {data.get('msg', 'unknown')}",
+                )
+
+            news_items = data.get("data", {}).get("data", [])
+            if not news_items:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=True,
+                )
+
+            cutoff = datetime.now() - timedelta(days=days)
+
+            results: List[SearchResult] = []
+            for item in news_items:
+                # 解析发布时间并过滤过期新闻
+                time_str = item.get("time", "")
+                published_date = ""
+                try:
+                    if time_str:
+                        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        if dt < cutoff:
+                            continue
+                        published_date = time_str[:10]
+                except (ValueError, TypeError):
+                    published_date = time_str[:10] if len(time_str) >= 10 else ""
+
+                url = item.get("url", "")
+
+                # 仅对最终需要返回的条目爬取正文（节省请求）
+                content = ""
+                if url and len(results) < max_results:
+                    content = fetch_url_content(url, timeout=5)
+
+                # 正文 > summary > title
+                snippet = content or item.get("summary", "") or item.get("title", "")
+
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    snippet=snippet[:1500],
+                    url=url,
+                    source=item.get("src", ""),
+                    published_date=published_date,
+                ))
+
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(
+                query=query,
+                results=results,
+                provider=self._name,
+                success=True,
+            )
+
+        except Exception as e:
+            logger.error("[QQFinance] 搜索失败: %s", e)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=str(e),
+            )
+
+
+class AkshareNewsProvider(BaseSearchProvider):
+    """Akshare 东方财富个股新闻搜索（免费，无需 API Key）
+
+    通过 akshare 的 ``stock_news_em`` 接口获取个股新闻资讯，
+    数据来源为东方财富，仅支持 A 股。
+    """
+
+    _STOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
+
+    def __init__(self):
+        super().__init__(api_keys=["akshare_free"], name="AkshareNews")
+
+    @property
+    def is_available(self) -> bool:
+        """akshare 免费，始终可用"""
+        return True
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
+        """Base class contract — delegates to ``search``."""
+        return self.search(query, max_results=max_results, days=days)
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
+        """搜索新闻
+
+        从查询字符串中提取 6 位股票代码，调用 akshare ``stock_news_em``
+        获取个股新闻，并转换为统一的 SearchResult 列表。
+        """
+        match = self._STOCK_CODE_RE.search(query)
+        if not match:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="AkshareNews: 无法从查询中提取股票代码",
+            )
+
+        stock_code = match.group(1)
+
+        try:
+            df = ak.stock_news_em(symbol=stock_code)
+
+            if df is None or df.empty:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=True,
+                )
+
+            cutoff = datetime.now() - timedelta(days=days)
+            results: List[SearchResult] = []
+
+            # 兼容不同版本 akshare 的列名
+            col_title = _first_existing(df.columns, ["标题", "新闻标题", "title"])
+            col_content = _first_existing(df.columns, ["内容", "新闻内容", "content"])
+            col_time = _first_existing(df.columns, ["发布时间", "时间", "datetime"])
+            col_source = _first_existing(df.columns, ["文章来源", "来源", "source"])
+            col_url = _first_existing(df.columns, ["新闻链接", "链接", "url"])
+
+            for _, row in df.iterrows():
+                # 解析发布时间并过滤过期新闻
+                time_str = str(row[col_time]) if col_time else ""
+                published_date = ""
+                if time_str:
+                    try:
+                        dt = datetime.strptime(time_str[:19], "%Y-%m-%d %H:%M:%S")
+                        if dt < cutoff:
+                            continue
+                        published_date = time_str[:10]
+                    except (ValueError, TypeError):
+                        published_date = time_str[:10] if len(time_str) >= 10 else ""
+
+                title = str(row[col_title]) if col_title else ""
+                content = str(row[col_content]) if col_content else ""
+                url = str(row[col_url]) if col_url else ""
+                source = str(row[col_source]) if col_source else ""
+
+                snippet = content or title
+
+                results.append(SearchResult(
+                    title=title,
+                    snippet=snippet[:1500],
+                    url=url,
+                    source=source,
+                    published_date=published_date,
+                ))
+
+                if len(results) >= max_results:
+                    break
+
+            return SearchResponse(
+                query=query,
+                results=results,
+                provider=self._name,
+                success=True,
+            )
+
+        except Exception as e:
+            logger.error("[AkshareNews] 搜索失败: %s", e)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=str(e),
+            )
+
+
+def _first_existing(columns: Any, names: list) -> Optional[str]:
+    """从 DataFrame columns 中返回第一个存在的列名"""
+    for name in names:
+        if name in columns:
+            return name
+    return None
+
+
 class SearchService:
     """
     搜索服务
@@ -2127,6 +2409,8 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        qq_finance_enabled: bool = False,
+        akshare_news_enabled: bool = True,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2142,6 +2426,8 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            qq_finance_enabled: 是否启用腾讯财经个股新闻（免费，仅 A 股）
+            akshare_news_enabled: 是否启用 akshare 东方财富个股新闻（免费，仅 A 股）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2205,7 +2491,17 @@ class SearchService:
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
-            
+
+        # 8. QQ Finance（腾讯财经个股新闻，免费，仅 A 股有效）
+        if qq_finance_enabled:
+            self._providers.append(QQSearchProvider())
+            logger.info("已启用腾讯财经(QQFinance)个股新闻")
+
+        # 9. AkshareNews（东方财富个股新闻，免费，仅 A 股有效）
+        if akshare_news_enabled:
+            self._providers.append(AkshareNewsProvider())
+            logger.info("已启用 akshare 东方财富个股新闻")
+
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
@@ -3444,6 +3740,8 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    qq_finance_enabled=getattr(config, "qq_finance_enabled", False),
+                    akshare_news_enabled=getattr(config, "akshare_news_enabled", True),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
@@ -3464,13 +3762,17 @@ if __name__ == "__main__":
         level=logging.DEBUG,
         format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
     )
+
+    stock_news = ak.stock_news_em(symbol="002497")
+    q =  stock_news.values[0][2]
+    print(stock_news)
     
     # 手动测试（需要配置 API Key）
     service = get_search_service()
     
     if service.is_available:
         print("=== 测试股票新闻搜索 ===")
-        response = service.search_stock_news("300389", "艾比森")
+        response = service.search_stock_news("002497", "雅化集团")
         print(f"搜索状态: {'成功' if response.success else '失败'}")
         print(f"搜索引擎: {response.provider}")
         print(f"结果数量: {len(response.results)}")
