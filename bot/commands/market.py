@@ -93,7 +93,11 @@ class MarketCommand(BotCommand):
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    qq_finance_enabled=config.qq_finance_enabled,
+                    akshare_news_enabled=config.akshare_news_enabled,
+                    baidu_finance_enabled=config.baidu_finance_enabled,
                     news_max_age_days=config.news_max_age_days,
+                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
 
             # 初始化 AI 分析器
