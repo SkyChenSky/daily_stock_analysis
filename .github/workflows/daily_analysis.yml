@@ -198,7 +198,11 @@ jobs:
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
-          
+          # 免费新闻源开关（默认 false，需启用时在 Settings → Variables 添加对应变量为 true）
+          AKSHARE_NEWS_ENABLED: ${{ vars.AKSHARE_NEWS_ENABLED || 'false' }}
+          BAIDU_FINANCE_ENABLED: ${{ vars.BAIDU_FINANCE_ENABLED || 'false' }}
+          QQ_FINANCE_ENABLED: ${{ vars.QQ_FINANCE_ENABLED || 'false' }}
+
         run: |
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
