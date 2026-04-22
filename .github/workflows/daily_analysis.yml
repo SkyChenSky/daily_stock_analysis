@@ -202,6 +202,9 @@ jobs:
           AKSHARE_NEWS_ENABLED: ${{ vars.AKSHARE_NEWS_ENABLED || 'false' }}
           BAIDU_FINANCE_ENABLED: ${{ vars.BAIDU_FINANCE_ENABLED || 'false' }}
           QQ_FINANCE_ENABLED: ${{ vars.QQ_FINANCE_ENABLED || 'false' }}
+          # 新闻时效配置（实际窗口 = min(profile_days, NEWS_MAX_AGE_DAYS)）
+          NEWS_MAX_AGE_DAYS: ${{ vars.NEWS_MAX_AGE_DAYS || '7' }}
+          NEWS_STRATEGY_PROFILE: ${{ vars.NEWS_STRATEGY_PROFILE || 'medium' }}
 
         run: |
           # 处理 LITELLM YAML 配置文件
