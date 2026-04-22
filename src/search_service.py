@@ -269,15 +269,16 @@ class BaseSearchProvider(ABC):
                 search_time=elapsed
             )
 
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """
         执行搜索
-        
+
         Args:
             query: 搜索关键词
             max_results: 最大返回结果数
             days: 搜索最近几天的时间范围（默认7天）
-            
+            **kwargs: 额外参数（由子类使用，基类忽略）
+
         Returns:
             SearchResponse 对象
         """
@@ -380,10 +381,11 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int = 5,
         days: int = 7,
         topic: Optional[str] = None,
+        **kwargs,
     ) -> SearchResponse:
         """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
         if topic is None:
-            return super().search(query, max_results=max_results, days=days)
+            return super().search(query, max_results=max_results, days=days, **kwargs)
 
         api_key = self._get_next_key()
         if not api_key:
@@ -1682,10 +1684,11 @@ class BraveSearchProvider(BaseSearchProvider):
         days: int = 7,
         search_lang: Optional[str] = None,
         country: Optional[str] = None,
+        **kwargs,
     ) -> SearchResponse:
         """执行 Brave 搜索，可按调用方传入区域与语言偏好。"""
         if search_lang is None and country is None:
-            return super().search(query, max_results=max_results, days=days)
+            return super().search(query, max_results=max_results, days=days, **kwargs)
 
         return self._execute_search(
             query,
@@ -2022,7 +2025,7 @@ class SearXNGSearchProvider(BaseSearchProvider):
         except Exception:
             return "未知来源"
 
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """Execute SearXNG search with instance rotation and per-request failover."""
         start_time = time.time()
         if self._base_urls:
@@ -2135,17 +2138,21 @@ class QQSearchProvider(BaseSearchProvider):
 
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
         """Base class contract — delegates to ``search``."""
-        return self.search(query, max_results=max_results, days=days)
+        return self.search(query, max_results=max_results, days=days, **kwargs)
 
     def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """搜索新闻
 
         从查询字符串中提取 6 位股票代码，调用腾讯财经 API 获取个股新闻，
         并对返回的每条新闻 URL 进行正文爬取以补充摘要。
+        支持通过 kwargs 传入 stock_code 以绕过从 query 中提取。
         """
-        # 从查询文本中提取股票代码
-        match = self._STOCK_CODE_RE.search(query)
-        if not match:
+        stock_code = kwargs.get("stock_code")
+        if not stock_code:
+            match = self._STOCK_CODE_RE.search(query)
+            if match:
+                stock_code = match.group(1)
+        if not stock_code:
             return SearchResponse(
                 query=query,
                 results=[],
@@ -2153,8 +2160,6 @@ class QQSearchProvider(BaseSearchProvider):
                 success=False,
                 error_message="QQFinance: 无法从查询中提取股票代码",
             )
-
-        stock_code = match.group(1)
         symbol = self._convert_symbol(stock_code)
 
         try:
@@ -2267,16 +2272,21 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
         """Base class contract — delegates to ``search``."""
-        return self.search(query, max_results=max_results, days=days)
+        return self.search(query, max_results=max_results, days=days, **kwargs)
 
     def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """搜索新闻
 
         从查询字符串中提取 6 位股票代码，调用百度财经接口获取个股新闻，
         并转换为统一的 SearchResult 列表。
+        支持通过 kwargs 传入 stock_code 以绕过从 query 中提取。
         """
-        match = self._STOCK_CODE_RE.search(query)
-        if not match:
+        stock_code = kwargs.get("stock_code")
+        if not stock_code:
+            match = self._STOCK_CODE_RE.search(query)
+            if match:
+                stock_code = match.group(1)
+        if not stock_code:
             return SearchResponse(
                 query=query,
                 results=[],
@@ -2284,8 +2294,6 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                 success=False,
                 error_message="BaiduFinance: 无法从查询中提取股票代码",
             )
-
-        stock_code = match.group(1)
 
         try:
             resp = _get_with_retry(
@@ -2399,16 +2407,21 @@ class AkshareNewsProvider(BaseSearchProvider):
 
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7, **kwargs) -> SearchResponse:
         """Base class contract — delegates to ``search``."""
-        return self.search(query, max_results=max_results, days=days)
+        return self.search(query, max_results=max_results, days=days, **kwargs)
 
     def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """搜索新闻
 
         从查询字符串中提取 6 位股票代码，调用 akshare ``stock_news_em``
         获取个股新闻，并转换为统一的 SearchResult 列表。
+        支持通过 kwargs 传入 stock_code 以绕过从 query 中提取。
         """
-        match = self._STOCK_CODE_RE.search(query)
-        if not match:
+        stock_code = kwargs.get("stock_code")
+        if not stock_code:
+            match = self._STOCK_CODE_RE.search(query)
+            if match:
+                stock_code = match.group(1)
+        if not stock_code:
             return SearchResponse(
                 query=query,
                 results=[],
@@ -2416,8 +2429,6 @@ class AkshareNewsProvider(BaseSearchProvider):
                 success=False,
                 error_message="AkshareNews: 无法从查询中提取股票代码",
             )
-
-        stock_code = match.group(1)
 
         try:
             df = ak.stock_news_em(symbol=stock_code)
@@ -3248,7 +3259,7 @@ class SearchService:
                         )
                     )
 
-                response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                response = provider.search(query, provider_max_results, days=search_days, stock_code=stock_code, **search_kwargs)
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
@@ -3569,6 +3580,7 @@ class SearchService:
                     dim['query'],
                     max_results=provider_max_results,
                     days=search_days,
+                    stock_code=stock_code,
                 )
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
@@ -3903,10 +3915,6 @@ if __name__ == "__main__":
         level=logging.DEBUG,
         format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
     )
-
-    stock_news = ak.stock_news_em(symbol="002497")
-    q =  stock_news.values[0][2]
-    print(stock_news)
     
     # 手动测试（需要配置 API Key）
     service = get_search_service()
