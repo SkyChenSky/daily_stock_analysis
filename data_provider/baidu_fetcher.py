@@ -29,7 +29,28 @@ from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import requests
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
+try:
+    from .base import (
+        BaseFetcher, DataFetchError, STANDARD_COLUMNS,
+        _is_hk_market, _is_etf_code, normalize_stock_code,
+    )
+    from .realtime_types import (
+        UnifiedRealtimeQuote, RealtimeSource,
+        safe_float, safe_int, get_realtime_circuit_breaker,
+    )
+except ImportError:
+    # 支持直接运行: python data_provider/baidu_fetcher.py
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from data_provider.base import (
+        BaseFetcher, DataFetchError, STANDARD_COLUMNS,
+        _is_hk_market, _is_etf_code, normalize_stock_code,
+    )
+    from data_provider.realtime_types import (
+        UnifiedRealtimeQuote, RealtimeSource,
+        safe_float, safe_int, get_realtime_circuit_breaker,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +78,12 @@ def _safe_float(val: str) -> float:
     if not val or val == '--':
         return 0.0
     return float(val)
+
+
+def _is_block_code(code: str) -> bool:
+    """判断是否为百度概念/行业板块代码（如 220000 基础化工）"""
+    normalized = normalize_stock_code(code)
+    return normalized.isdigit() and len(normalized) == 6 and normalized.startswith('22')
 
 
 class BaiduFetcher(BaseFetcher):
@@ -97,23 +124,32 @@ class BaiduFetcher(BaseFetcher):
         })
         self._session_cookies_ready = False
 
-    def _ensure_cookies(self, stock_code: str) -> None:
+    def _ensure_cookies(self, stock_code: str, referer_path: str = None) -> None:
         """
         确保已获取百度 Cookie（BAIDUID）
 
         访问 gushitong.baidu.com 的股票页面来获取必要的 Cookie，
         之后才能成功调用 K 线数据 API。
+        BAIDUID 是域级别 Cookie，即使页面返回非 200 也可能通过重定向设置。
         """
         if self._session_cookies_ready:
             return
         try:
-            page_url = GUSHITONG_BASE_URL.format(code=stock_code)
-            resp = self._session.get(page_url, timeout=_DEFAULT_TIMEOUT)
-            if resp.status_code == 200 and 'BAIDUID' in dict(self._session.cookies):
+            if referer_path:
+                page_url = f"https://gushitong.baidu.com/{referer_path}"
+            else:
+                normalized = normalize_stock_code(stock_code)
+                if _is_hk_market(normalized):
+                    api_code = normalized[2:] if normalized.upper().startswith('HK') else normalized
+                    page_url = f"https://gushitong.baidu.com/stock/hk-{api_code}"
+                else:
+                    page_url = GUSHITONG_BASE_URL.format(code=stock_code)
+            self._session.get(page_url, timeout=_DEFAULT_TIMEOUT)
+            if 'BAIDUID' in dict(self._session.cookies):
                 self._session_cookies_ready = True
                 logger.debug("[BaiduFetcher] Cookie 获取成功")
             else:
-                logger.warning(f"[BaiduFetcher] Cookie 获取异常: status={resp.status_code}")
+                logger.warning("[BaiduFetcher] Cookie 获取异常: BAIDUID 未设置")
         except requests.exceptions.RequestException as e:
             logger.warning(f"[BaiduFetcher] Cookie 获取失败: {e}")
 
@@ -126,9 +162,295 @@ class BaiduFetcher(BaseFetcher):
                 time.sleep(min_interval - elapsed)
         self._last_request_time = time.time()
 
+    def _get_api_config(self, stock_code: str) -> Dict[str, str]:
+        """
+        根据股票代码判断类型，返回对应的百度 API 参数
+
+        Returns:
+            dict with keys: group, market_type, code, is_kc, extra_params, referer_path
+        """
+        normalized = normalize_stock_code(stock_code)
+
+        # 港股：5位数字代码（如 00700、01801）
+        if _is_hk_market(normalized):
+            api_code = normalized[2:] if normalized.upper().startswith('HK') else normalized
+            return {
+                'group': 'quotation_kline_hk',
+                'market_type': 'hk',
+                'code': api_code,
+                'is_kc': '0',
+                'extra_params': f'&query={api_code}',
+                'referer_path': f'stock/hk-{api_code}',
+            }
+
+        # ETF/基金（如 512400、159919）
+        if _is_etf_code(normalized):
+            return {
+                'group': 'quotation_kline_ab',
+                'market_type': 'ab',
+                'code': normalized,
+                'is_kc': '0',
+                'extra_params': f'&query={normalized}&financeType=etf',
+                'referer_path': f'stock/ab-{normalized}',
+            }
+
+        # 概念/行业板块（如 220000 基础化工）
+        if _is_block_code(normalized):
+            return {
+                'group': 'quotation_block_kline',
+                'market_type': 'ab',
+                'code': normalized,
+                'is_kc': '0',
+                'extra_params': f'&query={normalized}',
+                'referer_path': f'stock/ab-{normalized}',
+            }
+
+        # 普通A股
+        is_kc = "1" if normalized.startswith('3') or normalized.startswith('688') else "0"
+        return {
+            'group': 'quotation_kline_ab',
+            'market_type': 'ab',
+            'code': normalized,
+            'is_kc': is_kc,
+            'extra_params': '',
+            'referer_path': f'stock/ab-{normalized}',
+        }
+
+    def _get_realtime_api_config(self, stock_code: str, stock_type: str = None) -> Dict[str, str]:
+        """
+        根据股票代码判断类型，返回对应的百度实时行情 API 参数
+
+        Args:
+            stock_code: 股票代码（已标准化）
+            stock_type: 可选类型提示，"block"=行业板块，"concept"=概念板块
+
+        Returns:
+            dict with keys: group, market_type, code, is_kc, extra_params,
+                            referer_path, use_srcid, double_fin_client
+        """
+        normalized = normalize_stock_code(stock_code)
+
+        # 港股
+        if _is_hk_market(normalized):
+            api_code = normalized[2:] if normalized.upper().startswith('HK') else normalized
+            return {
+                'group': 'quotation_minute_hk',
+                'market_type': 'hk',
+                'code': api_code,
+                'is_kc': '0',
+                'extra_params': '',
+                'referer_path': f'stock/hk-{api_code}',
+                'use_srcid': True,
+                'double_fin_client': True,
+                'include_is_kc': True,
+            }
+
+        # 行业/概念板块（显式指定或代码以22开头）
+        if stock_type in ('block', 'concept') or _is_block_code(normalized):
+            return {
+                'group': 'quotation_block_minute',
+                'market_type': 'ab',
+                'code': normalized,
+                'is_kc': '',
+                'extra_params': '',
+                'referer_path': f'stock/ab-{normalized}',
+                'use_srcid': False,
+                'double_fin_client': True,
+                'include_is_kc': False,
+            }
+
+        # ETF/基金
+        if _is_etf_code(normalized):
+            return {
+                'group': 'quotation_minute_ab',
+                'market_type': 'ab',
+                'code': normalized,
+                'is_kc': '0',
+                'extra_params': '&financeType=etf',
+                'referer_path': f'stock/ab-{normalized}',
+                'use_srcid': True,
+                'double_fin_client': True,
+                'include_is_kc': True,
+            }
+
+        # 普通A股
+        is_kc = "1" if normalized.startswith('3') or normalized.startswith('688') else "0"
+        return {
+            'group': 'quotation_minute_ab',
+            'market_type': 'ab',
+            'code': normalized,
+            'is_kc': is_kc,
+            'extra_params': '',
+            'referer_path': f'stock/ab-{normalized}',
+            'use_srcid': True,
+            'double_fin_client': True,
+            'include_is_kc': True,
+        }
+
+    @staticmethod
+    def _parse_pankou_value(pankou_list: list, ename: str) -> Optional[float]:
+        """
+        从 pankouinfos.list 中提取指定 ename 的 originValue 并转为 float
+
+        Args:
+            pankou_list: pankouinfos.list 数组
+            ename: 指标英文名 (如 'open', 'volumeRatio')
+
+        Returns:
+            浮点数值，未找到或转换失败返回 None
+        """
+        for item in pankou_list:
+            if item.get('ename') == ename:
+                origin = item.get('originValue')
+                if origin is not None:
+                    return _safe_float(str(origin))
+                return None
+        return None
+
+    def get_realtime_quote(self, stock_code: str, stock_type: str = None, stock_name: str = None) -> Optional[UnifiedRealtimeQuote]:
+        """
+        从百度财经获取实时行情数据
+
+        支持类型：A股、港股、ETF/基金、行业板块、概念板块
+
+        Args:
+            stock_code: 股票代码
+            stock_type: 可选类型提示，"block"=行业板块，"concept"=概念板块
+
+        Returns:
+            UnifiedRealtimeQuote 对象，失败返回 None
+        """
+        normalized = normalize_stock_code(stock_code)
+
+        # 检查熔断器
+        cb = get_realtime_circuit_breaker()
+        if not cb.is_available("baidu"):
+            logger.debug("[BaiduFetcher] 实时行情源 baidu 处于熔断状态，跳过")
+            return None
+
+        config = self._get_realtime_api_config(normalized, stock_type=stock_type)
+
+        # 确保 Cookie
+        self._ensure_cookies(normalized, config['referer_path'])
+
+        # 速率限制
+        self._enforce_rate_limit()
+
+        logger.info(
+            f"[BaiduFetcher] 请求实时行情: stock_code={normalized}, "
+            f"type={config['group']}"
+        )
+
+        # 构建请求 URL
+        url_parts = [f"{BAIDU_FINANCE_API_URL}?"]
+        if config['use_srcid']:
+            url_parts.append("srcid=5353&")
+        url_parts.append(f"pointType=string&group={config['group']}")
+        url_parts.append(f"&query={config['code']}")
+        url_parts.append(f"&code={config['code']}&market_type={config['market_type']}")
+        url_parts.append("&newFormat=1")
+        if stock_name:
+            from urllib.parse import quote
+            url_parts.append(f"&name={quote(stock_name)}")
+        if config.get('include_is_kc', True):
+            url_parts.append(f"&is_kc={config['is_kc']}")
+        url_parts.append(config.get('extra_params', ''))
+        url_parts.append("&finClientType=pc")
+        if config['double_fin_client']:
+            url_parts.append("&finClientType=pc")
+        url = ''.join(url_parts)
+
+        headers = {
+            'Referer': f"https://gushitong.baidu.com/{config['referer_path']}",
+        }
+
+        try:
+            response = self._session.get(
+                url,
+                headers=headers,
+                timeout=_DEFAULT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                self._session_cookies_ready = False
+            cb.record_failure("baidu", str(e))
+            logger.warning(f"[BaiduFetcher] 实时行情请求失败: {e}")
+            return None
+        except ValueError as e:
+            cb.record_failure("baidu", str(e))
+            logger.warning(f"[BaiduFetcher] 实时行情 JSON 解析失败: {e}")
+            return None
+
+        try:
+            result = data.get('Result', {})
+            if not result:
+                cb.record_failure("baidu", "Result 为空")
+                return None
+
+            # 提取 pankouinfos
+            pankou_list = result.get('pankouinfos', {}).get('list', [])
+            basic = result.get('basicinfos', {})
+            cur = result.get('cur', {})
+
+            code = basic.get('code', normalized)
+            name = basic.get('name', '')
+
+            # 从 cur 提取最新价、涨跌幅、涨跌额
+            raw_price = cur.get('price')
+            price = safe_float(raw_price) if raw_price else None
+
+            raw_ratio = cur.get('ratio', '')
+            change_pct = safe_float(str(raw_ratio).replace('%', ''))
+
+            raw_increase = cur.get('increase', '')
+            change_amount = safe_float(str(raw_increase))
+
+            # 从 pankouinfos 提取各项指标
+            quote = UnifiedRealtimeQuote(
+                code=code,
+                name=name,
+                source=RealtimeSource.BAIDU,
+                price=price,
+                change_pct=change_pct,
+                change_amount=change_amount,
+                volume=safe_int(self._parse_pankou_value(pankou_list, 'volume')),
+                amount=safe_float(self._parse_pankou_value(pankou_list, 'amount')),
+                volume_ratio=self._parse_pankou_value(pankou_list, 'volumeRatio'),
+                turnover_rate=self._parse_pankou_value(pankou_list, 'turnoverRatio'),
+                amplitude=self._parse_pankou_value(pankou_list, 'amplitudeRatio'),
+                open_price=self._parse_pankou_value(pankou_list, 'open'),
+                high=self._parse_pankou_value(pankou_list, 'high'),
+                low=self._parse_pankou_value(pankou_list, 'low'),
+                pre_close=self._parse_pankou_value(pankou_list, 'preClose'),
+                pe_ratio=self._parse_pankou_value(pankou_list, 'peratio'),
+                pb_ratio=self._parse_pankou_value(pankou_list, 'bvRatio'),
+                total_mv=safe_float(self._parse_pankou_value(pankou_list, 'capitalization')),
+                circ_mv=safe_float(self._parse_pankou_value(pankou_list, 'currencyValue')),
+                high_52w=self._parse_pankou_value(pankou_list, 'w52_high'),
+                low_52w=self._parse_pankou_value(pankou_list, 'w52_low'),
+            )
+
+            if not quote.has_basic_data():
+                cb.record_failure("baidu", "price 无有效数据")
+                logger.debug(f"[BaiduFetcher] {normalized} 实时行情 price 无效: {price}")
+                return None
+
+            cb.record_success("baidu")
+            logger.info(f"[BaiduFetcher] {normalized} 实时行情获取成功: {name} {price}")
+            return quote
+
+        except Exception as e:
+            cb.record_failure("baidu", str(e))
+            logger.warning(f"[BaiduFetcher] 实时行情解析异常: {e}")
+            return None
+
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         从百度财经获取原始 K 线数据
+
+        支持类型：A股、港股、ETF/基金、概念/行业板块
 
         Args:
             stock_code: 股票代码
@@ -138,28 +460,32 @@ class BaiduFetcher(BaseFetcher):
         Returns:
             原始 DataFrame
         """
+        # 根据代码类型获取 API 参数
+        config = self._get_api_config(stock_code)
+
         # 确保有 Cookie
-        self._ensure_cookies(stock_code)
+        self._ensure_cookies(stock_code, config['referer_path'])
 
         # 速率限制
         self._enforce_rate_limit()
 
-        logger.info(f"[BaiduFetcher] 请求 K 线数据: stock_code={stock_code}, range={start_date}~{end_date}")
-
-        # 根据代码判断 is_kc 参数
-        is_kc = "1" if stock_code.startswith('3') else "0"
+        logger.info(
+            f"[BaiduFetcher] 请求 K 线数据: stock_code={stock_code}, "
+            f"type={config['group']}, range={start_date}~{end_date}"
+        )
 
         # 百度 API 要求 finClientType=pc 出现两次，手动拼接 URL
         url = (
             f"{BAIDU_FINANCE_API_URL}?"
-            f"srcid=5353&pointType=string&group=quotation_kline_ab"
-            f"&code={stock_code}&market_type=ab&newFormat=1"
-            f"&is_kc={is_kc}&ktype=day"
+            f"srcid=5353&pointType=string&group={config['group']}"
+            f"&code={config['code']}&market_type={config['market_type']}"
+            f"&newFormat=1&is_kc={config['is_kc']}&ktype=day"
+            f"{config['extra_params']}"
             f"&finClientType=pc&finClientType=pc"
         )
 
         headers = {
-            'Referer': f'https://gushitong.baidu.com/stock/ab-{stock_code}',
+            'Referer': f"https://gushitong.baidu.com/{config['referer_path']}",
         }
 
         try:
@@ -309,58 +635,45 @@ class BaiduFetcher(BaseFetcher):
         return df
 
 if __name__ == "__main__":
-    
+
     # 测试代码
-    logging.basicConfig(level=logging.DEBUG)
-    
+    logging.basicConfig(level=logging.INFO)
+
     fetcher = BaiduFetcher()
-    
-    # 测试普通股票
+
+    # 测试 A 股实时行情
     print("=" * 50)
-    print("测试普通股票数据获取")
-    print("=" * 50)
-    try:
-        df = fetcher.get_daily_data('600519')  # 茅台
-        print(f"[股票] 获取成功，共 {len(df)} 条数据")
-        print(df.tail())
-    except Exception as e:
-        print(f"[股票] 获取失败: {e}")
-    
-    # 测试 ETF 基金
-    print("\n" + "=" * 50)
-    print("测试 ETF 基金数据获取")
+    print("测试 A 股实时行情获取")
     print("=" * 50)
     try:
-        df = fetcher.get_daily_data('512400')  # 有色龙头ETF
-        print(f"[ETF] 获取成功，共 {len(df)} 条数据")
-        print(df.tail())
+        quote = fetcher.get_realtime_quote('002497')  # 贵州茅台
+        if quote:
+            print(f"[A股实时] {quote.name}: 价格={quote.price}, 涨跌幅={quote.change_pct}%")
+            print(f"  开盘={quote.open_price}, 最高={quote.high}, 最低={quote.low}, 昨收={quote.pre_close}")
+            print(f"  成交量={quote.volume}, 成交额={quote.amount}")
+            print(f"  量比={quote.volume_ratio}, 换手率={quote.turnover_rate}, 振幅={quote.amplitude}")
+            print(f"  PE={quote.pe_ratio}, PB={quote.pb_ratio}")
+            print(f"  总市值={quote.total_mv}, 流通市值={quote.circ_mv}")
+            print(f"  52周高={quote.high_52w}, 52周低={quote.low_52w}")
+            print(f"  source={quote.source}")
+        else:
+            print("[A股实时] 未获取到数据")
     except Exception as e:
-        print(f"[ETF] 获取失败: {e}")
-    
+        print(f"[A股实时] 获取失败: {e}")
+
     # 测试 ETF 实时行情
     print("\n" + "=" * 50)
     print("测试 ETF 实时行情获取")
     print("=" * 50)
     try:
-        quote = fetcher.get_realtime_quote('512880')  # 证券ETF
+        quote = fetcher.get_realtime_quote('513310')  # 证券ETF
         if quote:
             print(f"[ETF实时] {quote.name}: 价格={quote.price}, 涨跌幅={quote.change_pct}%")
         else:
             print("[ETF实时] 未获取到数据")
     except Exception as e:
         print(f"[ETF实时] 获取失败: {e}")
-    
-    # 测试港股历史数据
-    print("\n" + "=" * 50)
-    print("测试港股历史数据获取")
-    print("=" * 50)
-    try:
-        df = fetcher.get_daily_data('00700')  # 腾讯控股
-        print(f"[港股] 获取成功，共 {len(df)} 条数据")
-        print(df.tail())
-    except Exception as e:
-        print(f"[港股] 获取失败: {e}")
-    
+
     # 测试港股实时行情
     print("\n" + "=" * 50)
     print("测试港股实时行情获取")
@@ -374,47 +687,28 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[港股实时] 获取失败: {e}")
 
-    # 测试市场统计
+    # 测试行业板块实时行情
     print("\n" + "=" * 50)
-    print("Testing get_market_stats (akshare)")
+    print("测试行业板块实时行情获取")
     print("=" * 50)
     try:
-        stats = fetcher.get_market_stats()
-        if stats:
-            print(f"Market Stats successfully computed:")
-            print(f"Up: {stats['up_count']} (Limit Up: {stats['limit_up_count']})")
-            print(f"Down: {stats['down_count']} (Limit Down: {stats['limit_down_count']})")
-            print(f"Flat: {stats['flat_count']}")
-            print(f"Total Amount: {stats['total_amount']:.2f} 亿 (Yi)")
+        quote = fetcher.get_realtime_quote('220000', stock_name='基础化工')
+        if quote:
+            print(f"[行业板块实时] {quote.name}: 价格={quote.price}, 涨跌幅={quote.change_pct}%")
         else:
-            print("Failed to compute market stats.")
+            print("[行业板块实时] 未获取到数据（可能需要特定网络环境）")
     except Exception as e:
-        print(f"Failed to compute market stats: {e}")
+        print(f"[行业板块实时] 获取失败: {e}")
 
-    # 测试筹码分布数据
+    # 测试概念板块实时行情
     print("\n" + "=" * 50)
-    print("测试筹码分布数据获取")
+    print("测试概念板块实时行情获取")
     print("=" * 50)
     try:
-        chip = fetcher.get_chip_distribution('600519')  # 茅台
-    except Exception as e:
-        print(f"[筹码分布] 获取失败: {e}")
-
-    # 测试行业板块排名
-    print("\n" + "=" * 50)
-    print("测试行业板块排名获取")
-    print("=" * 50)
-    try:
-        rankings = fetcher.get_sector_rankings(n=5)
-        if rankings:
-            top, bottom = rankings
-            print("涨幅榜 Top 5:")
-            for sector in top:
-                print(f"{sector['name']}: {sector['change_pct']}%")
-            print("\n跌幅榜 Top 5:")
-            for sector in bottom:
-                print(f"{sector['name']}: {sector['change_pct']}%")
+        quote = fetcher.get_realtime_quote('003490', stock_type='concept', stock_name='军工')
+        if quote:
+            print(f"[概念板块实时] {quote.name}: 价格={quote.price}, 涨跌幅={quote.change_pct}%")
         else:
-            print("未获取到行业板块排名数据")
+            print("[概念板块实时] 未获取到数据（可能需要特定网络环境）")
     except Exception as e:
-        print(f"[行业板块排名] 获取失败: {e}")
+        print(f"[概念板块实时] 获取失败: {e}")

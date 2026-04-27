@@ -99,6 +99,7 @@ class RealtimeSource(Enum):
     AKSHARE_QQ = "akshare_qq"       # 腾讯财经
     TUSHARE = "tushare"             # Tushare Pro
     TENCENT = "tencent"             # 腾讯直连
+    BAIDU = "baidu"                 # 百度财经
     SINA = "sina"                   # 新浪直连
     STOOQ = "stooq"                 # Stooq 美股兜底
     LONGBRIDGE = "longbridge"       # 长桥（美股/港股兜底）

@@ -1136,7 +1136,8 @@ class DataFetcherManager:
         3. AkshareFetcher.get_realtime_quote(source="em")  - 东财
         4. AkshareFetcher.get_realtime_quote(source="sina") - 新浪
         5. AkshareFetcher.get_realtime_quote(source="tencent") - 腾讯
-        6. 返回 None（降级兜底）
+        6. BaiduFetcher.get_realtime_quote() - 百度财经
+        7. 返回 None（降级兜底）
         
         Args:
             stock_code: 股票代码
@@ -1250,6 +1251,14 @@ class DataFetcherManager:
                         if fetcher.name == "TushareFetcher":
                             if hasattr(fetcher, 'get_realtime_quote'):
                                 quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+                            break
+
+                elif source == "baidu":
+                    # 尝试 BaiduFetcher 百度财经数据源
+                    for fetcher in self._get_fetchers_snapshot():
+                        if fetcher.name == "BaiduFetcher":
+                            if hasattr(fetcher, 'get_realtime_quote'):
+                                quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code)
                             break
                 
                 if quote is not None and quote.has_basic_data():
