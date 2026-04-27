@@ -892,6 +892,25 @@ class DataFetcherManager:
             # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
             self._fetchers.sort(key=lambda f: f.priority)
 
+            # 如果配置了 historical_source_priority，按配置顺序重排
+            from src.config import get_config
+            hist_priority = get_config().historical_source_priority
+            if hist_priority:
+                name_to_fetcher = {f.name: f for f in self._fetchers}
+                ordered = []
+                seen = set()
+                for src in hist_priority.split(','):
+                    src = src.strip()
+                    fetcher_name = f"{src.capitalize()}Fetcher"
+                    if fetcher_name in name_to_fetcher and fetcher_name not in seen:
+                        ordered.append(name_to_fetcher[fetcher_name])
+                        seen.add(fetcher_name)
+                # 未在配置中列出的 fetcher 保持原顺序追加到末尾
+                for f in self._fetchers:
+                    if f.name not in seen:
+                        ordered.append(f)
+                self._fetchers = ordered
+
         # 构建优先级说明
         priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._get_fetchers_snapshot()])
         logger.info(f"已初始化 {len(self._fetchers)} 个数据源（按优先级）: {priority_info}")

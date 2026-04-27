@@ -92,6 +92,7 @@ def test_manager_does_not_warn_when_fallback_source_succeeds(mock_get_config, ca
     mock_get_config.return_value = SimpleNamespace(
         enable_realtime_quote=True,
         realtime_source_priority="efinance,akshare_em",
+        historical_source_priority="",
     )
     manager = DataFetcherManager(
         fetchers=[
@@ -133,6 +134,7 @@ def test_event_monitor_keeps_manager_failure_summary_for_direct_quote_call(mock_
     mock_get_config.return_value = SimpleNamespace(
         enable_realtime_quote=True,
         realtime_source_priority="efinance",
+        historical_source_priority="",
     )
     manager = DataFetcherManager(
         fetchers=[

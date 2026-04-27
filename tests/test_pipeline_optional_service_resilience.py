@@ -23,6 +23,7 @@ def _make_config() -> SimpleNamespace:
         news_strategy_profile="short",
         enable_realtime_quote=False,
         realtime_source_priority=[],
+        historical_source_priority="",
         enable_chip_distribution=False,
         social_sentiment_api_key="",
         social_sentiment_api_url="https://example.invalid/social",

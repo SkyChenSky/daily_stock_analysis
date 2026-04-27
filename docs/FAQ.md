@@ -37,6 +37,7 @@
    REALTIME_SOURCE_PRIORITY=tencent,akshare_sina,efinance,akshare_em
    ```
 3. 系统已内置 5 日均量计算作为兜底逻辑
+4. 如需调整历史行情数据源顺序，可配置 `HISTORICAL_SOURCE_PRIORITY`（详见 .env.example）
 
 > 📌 相关 Issue: [#155](https://github.com/ZhuLinsen/daily_stock_analysis/issues/155)
 

@@ -689,6 +689,9 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em,baidu"
+    # 历史行情数据源优先级（逗号分隔，为空则使用各 fetcher 的内置 priority 排序）
+    # 可选值：efinance, akshare, baidu, tushare, pytdx, baostock, yfinance, longbridge
+    historical_source_priority: str = ""
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -1379,6 +1382,7 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
+            historical_source_priority=cls._resolve_historical_source_priority(),
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
@@ -1902,6 +1906,32 @@ class Config:
             return resolved
 
         return default_priority
+
+    @classmethod
+    def _resolve_historical_source_priority(cls) -> str:
+        """
+        Resolve historical source priority.
+
+        1. If HISTORICAL_SOURCE_PRIORITY is explicitly set, return it.
+        2. If not set but TUSHARE_TOKEN is configured, return a default with
+           tushare first so the paid source is utilized.
+        3. Otherwise return empty string (use built-in priority sorting).
+        """
+        explicit = os.getenv('HISTORICAL_SOURCE_PRIORITY')
+        if explicit and explicit.strip():
+            return explicit.strip()
+
+        tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
+        if tushare_token:
+            import logging
+            logger = logging.getLogger(__name__)
+            resolved = 'tushare,efinance,akshare,baidu,pytdx,baostock,yfinance,longbridge'
+            logger.info(
+                f"TUSHARE_TOKEN detected, auto-injecting tushare into historical priority: {resolved}"
+            )
+            return resolved
+
+        return ""
 
     @classmethod
     def reset_instance(cls) -> None:

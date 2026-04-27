@@ -37,6 +37,7 @@ This document compiles common issues encountered by users and their solutions.
    REALTIME_SOURCE_PRIORITY=tencent,akshare_sina,efinance,akshare_em
    ```
 3. System has built-in 5-day average volume calculation as fallback
+4. To adjust historical data source order, configure `HISTORICAL_SOURCE_PRIORITY` (see .env.example)
 
 > Related Issue: [#155](https://github.com/ZhuLinsen/daily_stock_analysis/issues/155)
 

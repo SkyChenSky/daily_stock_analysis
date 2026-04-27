@@ -36,6 +36,7 @@ class TestHKRealtimeRouting(unittest.TestCase):
         mock_get_config.return_value = SimpleNamespace(
             enable_realtime_quote=True,
             realtime_source_priority="tencent,akshare_sina,efinance,akshare_em,tushare",
+            historical_source_priority="",
         )
 
         efinance = _DummyFetcher("EfinanceFetcher", 0, result={"should": "not be called"})

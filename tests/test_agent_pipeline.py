@@ -346,6 +346,7 @@ class TestAgentResultConversion(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
@@ -548,6 +549,7 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
@@ -594,6 +596,7 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
@@ -647,6 +650,7 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
@@ -1039,6 +1043,7 @@ class TestSafeInt(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
@@ -1182,6 +1187,7 @@ class TestSkillActivation(unittest.TestCase):
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
+            mock_cfg.historical_source_priority = ""
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
 
