@@ -2255,11 +2255,16 @@ class QQSearchProvider(BaseSearchProvider):
 class BaiduFinanceSearchProvider(BaseSearchProvider):
     """百度财经个股新闻搜索（免费，无需 API Key）
 
-    通过百度财经 ``finance.pae.baidu.com`` 接口获取个股新闻资讯，
-    仅支持 A 股。
+    通过百度财经多个接口聚合获取个股新闻资讯：
+    1. 新闻 (/vapi/sentimentlist)
+    2. 公司公告 (/api/stockwidget)
+    3. 机构研报 (/opendata)
+    仅支持 A 股，单个源失败不影响其他源。
     """
 
     _BAIDU_API_URL = "https://finance.pae.baidu.com/vapi/sentimentlist"
+    _BAIDU_WIDGET_URL = "https://finance.pae.baidu.com/api/stockwidget"
+    _BAIDU_REPORT_URL = "https://finance.baidu.com/opendata"
     _STOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
 
     def __init__(self):
@@ -2274,38 +2279,53 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
         """Base class contract — delegates to ``search``."""
         return self.search(query, max_results=max_results, days=days, **kwargs)
 
-    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
-        """搜索新闻
+    # ------------------------------------------------------------------
+    # 辅助方法
+    # ------------------------------------------------------------------
 
-        从查询字符串中提取 6 位股票代码，调用百度财经接口获取个股新闻，
-        并转换为统一的 SearchResult 列表。
-        支持通过 kwargs 传入 stock_code 以绕过从 query 中提取。
-        """
+    def _build_headers(self) -> Dict[str, str]:
+        """构建通用请求头"""
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/91.0.4472.124 Safari/537.36"
+            ),
+            "Referer": "https://finance.pae.baidu.com/",
+        }
+
+    def _extract_stock_code(self, query: str, **kwargs) -> Optional[str]:
+        """从查询字符串或 kwargs 中提取 6 位股票代码"""
         stock_code = kwargs.get("stock_code")
         if not stock_code:
             match = self._STOCK_CODE_RE.search(query)
             if match:
                 stock_code = match.group(1)
-        if not stock_code:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message="BaiduFinance: 无法从查询中提取股票代码",
-            )
+        return stock_code
 
+    def _empty_response(self, query: str, error_message: str) -> SearchResponse:
+        """构建空 / 错误响应"""
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message=error_message,
+        )
+
+    # ------------------------------------------------------------------
+    # 三源数据获取
+    # ------------------------------------------------------------------
+
+    def _fetch_sentiment_news(
+        self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+    ) -> Optional[List[SearchResult]]:
+        """源1: 新闻 — 原有 /vapi/sentimentlist 接口"""
+        results: List[SearchResult] = []
         try:
             resp = _get_with_retry(
                 self._BAIDU_API_URL,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/91.0.4472.124 Safari/537.36"
-                    ),
-                    "Referer": "https://finance.pae.baidu.com/",
-                },
+                headers=headers,
                 params={
                     "market": "ab",
                     "code": stock_code,
@@ -2319,7 +2339,6 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             resp.raise_for_status()
             data = resp.json()
 
-            # 解析嵌套 JSON: Result[0].TplData.aiSentimentXcxListInfo.sentimentListInfo
             result_list = (
                 data.get("Result", [{}])[0]
                 .get("TplData", {})
@@ -2327,19 +2346,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                 .get("sentimentListInfo", [])
             )
 
-            if not result_list:
-                return SearchResponse(
-                    query=query,
-                    results=[],
-                    provider=self._name,
-                    success=True,
-                )
-
-            cutoff = datetime.now() - timedelta(days=days)
-            results: List[SearchResult] = []
-
             for item in result_list:
-                # 解析发布时间（Unix 时间戳）并过滤过期新闻
                 publish_time = item.get("publishTime", 0)
                 published_date = ""
                 if publish_time:
@@ -2351,7 +2358,6 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     except (ValueError, OSError):
                         pass
 
-                # benefitType 标注: 1=利好, 0=中性, -1=利空
                 benefit = item.get("benefitType", 0)
                 benefit_tag = {1: "【利好】", -1: "【利空】"}.get(benefit, "")
 
@@ -2370,15 +2376,370 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                 if len(results) >= max_results:
                     break
 
+        except Exception as e:
+            logger.warning("[BaiduFinance] 新闻源失败: %s", e)
+            return None
+
+        return results
+
+    def _fetch_widget_news(
+        self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+    ) -> Optional[List[SearchResult]]:
+        """源2: 组件新闻/公告/研报 — /api/stockwidget 接口
+
+        响应路径: Result.content.{news, tradeNews, fastNews, reportNews, noticeNews}
+        news/tradeNews/reportNews 为 flat list；noticeNews 为 dict 含 .list。
+        """
+        results: List[SearchResult] = []
+        try:
+            resp = _get_with_retry(
+                self._BAIDU_WIDGET_URL,
+                headers=headers,
+                params={
+                    "code": stock_code,
+                    "type": "stock",
+                    "market": "ab",
+                    "widgetType": "news",
+                    "finClientType": "pc",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+            # 实际响应路径: Result.content
+            content = payload.get("Result", {}).get("content", {})
+            if not content:
+                return results
+
+            # --- 个股新闻 (news) + 行业新闻 (tradeNews) ---
+            for key in ("news", "tradeNews"):
+                items = content.get(key, [])
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if len(results) >= max_results:
+                        return results
+                    publish_time = item.get("publish_time", 0)
+                    published_date = ""
+                    if publish_time:
+                        try:
+                            dt = datetime.fromtimestamp(int(publish_time))
+                            if dt < cutoff:
+                                continue
+                            published_date = dt.strftime("%Y-%m-%d")
+                        except (ValueError, OSError):
+                            pass
+
+                    title = item.get("title", "")
+                    if not title:
+                        continue
+
+                    evaluate = item.get("evaluate", "")
+                    content_items = (item.get("content") or {}).get("items") or []
+                    body = ""
+                    if content_items:
+                        body = content_items[0].get("data", "")
+
+                    snippet_parts = []
+                    if evaluate:
+                        snippet_parts.append(f"【{evaluate}】")
+                    snippet_parts.append(body)
+                    snippet = "".join(snippet_parts)[:1500]
+
+                    results.append(SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=item.get("original_url", ""),
+                        source=item.get("provider", ""),
+                        published_date=published_date,
+                    ))
+
+            # --- 快讯 (fastNews) — 无 title，用 content 字段 ---
+            fast_items = content.get("fastNews", [])
+            if isinstance(fast_items, list):
+                for item in fast_items:
+                    if len(results) >= max_results:
+                        return results
+                    fast_content = item.get("content", "")
+                    if not fast_content:
+                        continue
+                    # fastNews 没有 publish_time 时间戳，有 time 字段如 "04-14 17:56"
+                    results.append(SearchResult(
+                        title=fast_content[:80],
+                        snippet=fast_content[:1500],
+                        url=item.get("loc", ""),
+                        source="百度快讯",
+                        published_date=item.get("time", ""),
+                    ))
+
+            # --- 研报 (reportNews) — 与 /opendata 同结构 ---
+            report_items = content.get("reportNews", [])
+            if isinstance(report_items, list):
+                for item in report_items:
+                    if len(results) >= max_results:
+                        return results
+                    raw_time = item.get("publish_time") or item.get("create_time", "")
+                    published_date = ""
+                    if raw_time:
+                        try:
+                            raw_str = str(raw_time).strip()
+                            dt = datetime.fromtimestamp(int(raw_str))
+                            if dt < cutoff:
+                                continue
+                            published_date = dt.strftime("%Y-%m-%d")
+                        except (ValueError, OSError):
+                            pass
+
+                    title = item.get("title", "")
+                    if not title:
+                        continue
+
+                    provider = item.get("provider", "")
+                    report_class = item.get("class", "")
+                    change = item.get("change", "")
+                    author = item.get("author", "")
+                    report_type = item.get("type", "")
+
+                    snippet_parts = ["【研报】"]
+                    if report_class:
+                        snippet_parts.append(f"【评级: {report_class}】")
+                    if change:
+                        snippet_parts.append(change)
+                    detail_parts = [p for p in (provider, author, report_type) if p]
+                    if detail_parts:
+                        snippet_parts.append(" · ".join(detail_parts))
+                    snippet = "".join(snippet_parts)[:1500]
+
+                    results.append(SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=item.get("third_url", ""),
+                        source=provider or "研报",
+                        published_date=published_date,
+                    ))
+
+            # --- 公告 (noticeNews) ---
+            notice_data = content.get("noticeNews", {})
+            notice_items = notice_data.get("list") or []
+            for item in notice_items:
+                if len(results) >= max_results:
+                    return results
+                publish_time = item.get("publish_time", 0)
+                published_date = ""
+                if publish_time:
+                    try:
+                        dt = datetime.fromtimestamp(int(publish_time))
+                        if dt < cutoff:
+                            continue
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, OSError):
+                        pass
+
+                title = item.get("title", "")
+                if not title:
+                    continue
+
+                classifi = item.get("classifiName", "")
+                appendix = item.get("appendix") or []
+                pdf_url = appendix[0].get("url", "") if appendix else ""
+
+                snippet = f"【公告】{classifi}" if classifi else "【公告】"
+
+                results.append(SearchResult(
+                    title=title,
+                    snippet=snippet[:1500],
+                    url=pdf_url,
+                    source=classifi or "公司公告",
+                    published_date=published_date,
+                ))
+
+        except Exception as e:
+            logger.warning("[BaiduFinance] 组件新闻源失败: %s", e)
+            return None
+
+        return results
+
+    def _fetch_research_reports(
+        self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+    ) -> Optional[List[SearchResult]]:
+        """源3: 研报 — /opendata 接口"""
+        results: List[SearchResult] = []
+        try:
+            resp = _get_with_retry(
+                self._BAIDU_REPORT_URL,
+                headers=headers,
+                params={
+                    "resource_id": "5353",
+                    "dsp": "iphone",
+                    "group": "quotation_research_report",
+                    "finance_type": "report",
+                    "query": stock_code,
+                    "code": stock_code,
+                    "market_type": "ab",
+                    "all": "1",
+                    "pointType": "string",
+                    "report_type": "1",
+                    "type": "5",
+                    "pn": "0",
+                    "rn": "30",
+                    "from_mid": "1",
+                    "finClientType": "pc",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+            report_list = (
+                payload.get("Result", [{}])[0]
+                .get("DisplayData", {})
+                .get("resultData", {})
+                .get("tplData", {})
+                .get("result", {})
+                .get("report_list", [])
+            )
+
+            for report in report_list:
+                # 解析发布时间 (YYYYMMDD 格式)
+                raw_time = report.get("publish_time") or report.get("create_time", "")
+                published_date = ""
+                if raw_time:
+                    try:
+                        raw_str = str(raw_time).strip()
+                        dt = datetime.strptime(raw_str, "%Y%m%d")
+                        if dt < cutoff:
+                            continue
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, OSError):
+                        pass
+
+                title = report.get("title", "")
+                if not title:
+                    continue
+
+                provider = report.get("provider", "")
+                report_class = report.get("class", "")
+                change = report.get("change", "")
+                author = report.get("author", "")
+                report_type = report.get("type", "")
+
+                snippet_parts = ["【研报】"]
+                if report_class:
+                    snippet_parts.append(f"【评级: {report_class}】")
+                if change:
+                    snippet_parts.append(change)
+                detail_parts = [p for p in (provider, author, report_type) if p]
+                if detail_parts:
+                    snippet_parts.append(" · ".join(detail_parts))
+                snippet = "".join(snippet_parts)[:1500]
+
+                results.append(SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url="",
+                    source=provider or "研报",
+                    published_date=published_date,
+                ))
+
+                if len(results) >= max_results:
+                    break
+
+        except Exception as e:
+            logger.warning("[BaiduFinance] 研报源失败: %s", e)
+            return None
+
+        return results
+
+    # ------------------------------------------------------------------
+    # 去重合并
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """对标题做空白 + 标点归一化，用于去重比较"""
+        # 去除所有空白字符
+        t = re.sub(r'\s+', '', title)
+        # 将中文标点统一为英文标点
+        for cn, en in [('，', ','), ('。', '.'), ('！', '!'), ('？', '?'),
+                       ('：', ':'), ('；', ';'), ('“', '"'), ('”', '"'),
+                       ('（', '('), ('）', ')'), ('【', '['), ('】', ']'),
+                       ('《', '<'), ('》', '>'), ('、', '/')]:
+            t = t.replace(cn, en)
+        return t.lower()
+
+    def _merge_results(
+        self, all_results: List[SearchResult], seen_titles: set, new_results: List[SearchResult], max_results: int,
+    ) -> None:
+        """就地追加去重后的结果到 all_results"""
+        for r in new_results:
+            if len(all_results) >= max_results:
+                break
+            norm = self._normalize_title(r.title)
+            if norm in seen_titles:
+                continue
+            seen_titles.add(norm)
+            all_results.append(r)
+
+    # ------------------------------------------------------------------
+    # 聚合调度
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
+        """聚合搜索 — 三源依次获取，优雅降级
+
+        从查询字符串中提取 6 位股票代码，依次调用三个百度财经接口获取新闻，
+        去重合并后返回。单个源失败不影响其他源。
+        """
+        stock_code = self._extract_stock_code(query, **kwargs)
+        if not stock_code:
+            return self._empty_response(query, "BaiduFinance: 无法从查询中提取股票代码")
+
+        try:
+            headers = self._build_headers()
+            cutoff = datetime.now() - timedelta(days=days)
+            all_results: List[SearchResult] = []
+            seen_titles: set = set()
+            source_errors = 0
+
+            # 三个源各自独立，失败只 log 不阻断
+            sentiment = self._fetch_sentiment_news(stock_code, max_results, cutoff, headers)
+            if sentiment is None:
+                source_errors += 1
+            else:
+                self._merge_results(all_results, seen_titles, sentiment, max_results)
+
+            widget = self._fetch_widget_news(stock_code, max_results, cutoff, headers)
+            if widget is None:
+                source_errors += 1
+            else:
+                self._merge_results(all_results, seen_titles, widget, max_results)
+
+            reports = self._fetch_research_reports(stock_code, max_results, cutoff, headers)
+            if reports is None:
+                source_errors += 1
+            else:
+                self._merge_results(all_results, seen_titles, reports, max_results)
+
+            # 三个源全部异常 → success=False；部分或全部正常 → success=True
+            if source_errors >= 3:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=False,
+                    error_message="BaiduFinance: 所有数据源均请求失败",
+                )
+
             return SearchResponse(
                 query=query,
-                results=results,
+                results=all_results[:max_results],
                 provider=self._name,
                 success=True,
             )
 
         except Exception as e:
-            logger.error("[BaiduFinance] 搜索失败: %s", e)
+            logger.error("[BaiduFinance] 聚合搜索异常: %s", e)
             return SearchResponse(
                 query=query,
                 results=[],
