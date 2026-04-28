@@ -2266,6 +2266,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
     _BAIDU_WIDGET_URL = "https://finance.pae.baidu.com/api/stockwidget"
     _BAIDU_REPORT_URL = "https://finance.baidu.com/opendata"
     _STOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
+    _PER_SOURCE_LIMIT = 30  # 每个百度数据源独立拉取的上限
 
     def __init__(self):
         super().__init__(api_keys=["baidu_free"], name="BaiduFinance")
@@ -2669,12 +2670,10 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
         return t.lower()
 
     def _merge_results(
-        self, all_results: List[SearchResult], seen_titles: set, new_results: List[SearchResult], max_results: int,
+        self, all_results: List[SearchResult], seen_titles: set, new_results: List[SearchResult],
     ) -> None:
-        """就地追加去重后的结果到 all_results"""
+        """就地追加去重后的结果到 all_results（截断由调用方统一处理）"""
         for r in new_results:
-            if len(all_results) >= max_results:
-                break
             norm = self._normalize_title(r.title)
             if norm in seen_titles:
                 continue
@@ -2703,23 +2702,23 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             source_errors = 0
 
             # 三个源各自独立，失败只 log 不阻断
-            sentiment = self._fetch_sentiment_news(stock_code, max_results, cutoff, headers)
+            sentiment = self._fetch_sentiment_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
             if sentiment is None:
                 source_errors += 1
             else:
-                self._merge_results(all_results, seen_titles, sentiment, max_results)
+                self._merge_results(all_results, seen_titles, sentiment)
 
-            widget = self._fetch_widget_news(stock_code, max_results, cutoff, headers)
+            widget = self._fetch_widget_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
             if widget is None:
                 source_errors += 1
             else:
-                self._merge_results(all_results, seen_titles, widget, max_results)
+                self._merge_results(all_results, seen_titles, widget)
 
-            reports = self._fetch_research_reports(stock_code, max_results, cutoff, headers)
+            reports = self._fetch_research_reports(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
             if reports is None:
                 source_errors += 1
             else:
-                self._merge_results(all_results, seen_titles, reports, max_results)
+                self._merge_results(all_results, seen_titles, reports)
 
             # 三个源全部异常 → success=False；部分或全部正常 → success=True
             if source_errors >= 3:
@@ -2730,6 +2729,9 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     success=False,
                     error_message="BaiduFinance: 所有数据源均请求失败",
                 )
+
+            # 按发布日期倒序排列（最新的在前）
+            all_results.sort(key=lambda r: r.published_date or "", reverse=True)
 
             return SearchResponse(
                 query=query,

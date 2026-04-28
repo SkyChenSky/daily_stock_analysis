@@ -20,9 +20,11 @@ API 说明：
 4. 请求超时保护
 """
 
+import json
 import logging
 import os
 import random
+import re
 import time
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -56,6 +58,9 @@ logger = logging.getLogger(__name__)
 
 # 百度财经 API 基础 URL
 BAIDU_FINANCE_API_URL = "https://finance.pae.baidu.com/vapi/v1/getquotation"
+
+# 百度板块关联接口
+_BAIDU_RELATED_BLOCK_URL = "https://finance.pae.baidu.com/api/getrelatedblock"
 
 # 股票通页面（用于获取 Cookie）
 GUSHITONG_BASE_URL = "https://gushitong.baidu.com/stock/ab-{code}"
@@ -634,6 +639,106 @@ class BaiduFetcher(BaseFetcher):
 
         return df
 
+    def get_belong_board(self, stock_code: str) -> Optional[List[Dict[str, str]]]:
+        """
+        获取股票所属板块（行业/概念/地域）
+
+        数据来源：百度财经 getrelatedblock 接口
+
+        Args:
+            stock_code: 股票代码
+
+        Returns:
+            板块列表 [{"name": "板块名", "code": "板块代码", "type": "行业/概念/地域"}, ...]
+            失败返回 None
+        """
+        normalized = normalize_stock_code(stock_code)
+
+        # 确保 Cookie
+        self._ensure_cookies(normalized)
+
+        # 速率限制
+        self._enforce_rate_limit()
+
+        # 构造参数
+        stock_param = json.dumps(
+            {"market": "ab", "type": "stock", "code": normalized},
+            separators=(',', ':'),
+        )
+        params = {
+            "stock": stock_param,
+            "finClientType": "pc",
+        }
+
+        headers = {
+            'Referer': f"https://gushitong.baidu.com/stock/ab-{normalized}",
+        }
+
+        logger.info(f"[BaiduFetcher] 请求所属板块: stock_code={normalized}")
+
+        try:
+            response = self._session.get(
+                _BAIDU_RELATED_BLOCK_URL,
+                params=params,
+                headers=headers,
+                timeout=_DEFAULT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                self._session_cookies_ready = False
+            logger.warning(f"[BaiduFetcher] 所属板块请求失败: {e}")
+            return None
+        except ValueError as e:
+            logger.warning(f"[BaiduFetcher] 所属板块 JSON 解析失败: {e}")
+            return None
+
+        try:
+            result = data.get('Result', {})
+            if not result:
+                logger.debug(f"[BaiduFetcher] {normalized} 所属板块 Result 为空")
+                return None
+
+            boards: List[Dict[str, str]] = []
+            # Result 结构: {"603799": [{name: "行业", list: [...]}, ...]}
+            categories = result.get(normalized, [])
+            if not isinstance(categories, list):
+                categories = []
+            for cat in categories:
+                category = cat.get('name', '').strip()
+                if not category:
+                    continue
+                block_list = cat.get('list', [])
+                if not block_list:
+                    continue
+                for item in block_list:
+                    name = item.get('name', '').strip()
+                    if not name:
+                        continue
+                    # 从 xcx_query 字段提取板块代码，格式如 "code=240000"
+                    code = ''
+                    xcx_query = item.get('xcx_query', '')
+                    if xcx_query:
+                        m = re.search(r'code=([A-Za-z0-9]+)', xcx_query)
+                        if m:
+                            code = m.group(1)
+                    entry: Dict[str, str] = {"name": name, "type": category}
+                    if code:
+                        entry["code"] = code
+                    boards.append(entry)
+
+            if not boards:
+                logger.debug(f"[BaiduFetcher] {normalized} 未解析到板块信息")
+                return None
+
+            logger.info(f"[BaiduFetcher] {normalized} 所属板块获取成功: {len(boards)} 个")
+            return boards
+
+        except Exception as e:
+            logger.warning(f"[BaiduFetcher] 所属板块解析异常: {e}")
+            return None
+
 if __name__ == "__main__":
 
     # 测试代码
@@ -712,3 +817,18 @@ if __name__ == "__main__":
             print("[概念板块实时] 未获取到数据（可能需要特定网络环境）")
     except Exception as e:
         print(f"[概念板块实时] 获取失败: {e}")
+
+    # 测试所属板块
+    print("\n" + "=" * 50)
+    print("测试所属板块获取")
+    print("=" * 50)
+    try:
+        boards = fetcher.get_belong_board('603799')
+        if boards:
+            print(f"[所属板块] 获取到 {len(boards)} 个板块:")
+            for b in boards:
+                print(f"  {b.get('type', '?')}: {b.get('name')} (code={b.get('code', '')})")
+        else:
+            print("[所属板块] 未获取到数据")
+    except Exception as e:
+        print(f"[所属板块] 获取失败: {e}")
