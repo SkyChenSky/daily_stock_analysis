@@ -62,6 +62,12 @@ BAIDU_FINANCE_API_URL = "https://finance.pae.baidu.com/vapi/v1/getquotation"
 # 百度板块关联接口
 _BAIDU_RELATED_BLOCK_URL = "https://finance.pae.baidu.com/api/getrelatedblock"
 
+# 百度市场涨跌统计接口
+_BAIDU_MARKET_QUOTE_URL = "https://finance.pae.baidu.com/sapi/v1/marketquote"
+
+# 百度行业板块排行接口
+_BAIDU_BLOCKS_RANK_URL = "https://finance.pae.baidu.com/vapi/v2/blocks"
+
 # 股票通页面（用于获取 Cookie）
 GUSHITONG_BASE_URL = "https://gushitong.baidu.com/stock/ab-{code}"
 
@@ -128,6 +134,7 @@ class BaiduFetcher(BaseFetcher):
             'User-Agent': random.choice(USER_AGENTS),
         })
         self._session_cookies_ready = False
+        self._finance_cookies_ready = False
 
     def _ensure_cookies(self, stock_code: str, referer_path: str = None) -> None:
         """
@@ -157,6 +164,29 @@ class BaiduFetcher(BaseFetcher):
                 logger.warning("[BaiduFetcher] Cookie 获取异常: BAIDUID 未设置")
         except requests.exceptions.RequestException as e:
             logger.warning(f"[BaiduFetcher] Cookie 获取失败: {e}")
+
+    def _ensure_finance_cookies(self) -> None:
+        """
+        确保已获取 finance.baidu.com 域的 Cookie
+
+        指数行情、市场统计、板块排行等接口需通过 finance.baidu.com 页面获取 Cookie，
+        与 gushitong.baidu.com 的 Cookie 获取逻辑分开管理。
+        """
+        if self._finance_cookies_ready:
+            return
+        try:
+            # 先确保有 BAIDUID 基础 Cookie
+            if not self._session_cookies_ready:
+                self._ensure_cookies('000001')
+            # 访问 finance.baidu.com 首页获取该域的 Cookie
+            self._session.get("https://finance.baidu.com/", timeout=_DEFAULT_TIMEOUT)
+            if 'BAIDUID' in dict(self._session.cookies):
+                self._finance_cookies_ready = True
+                logger.debug("[BaiduFetcher] finance.baidu.com Cookie 获取成功")
+            else:
+                logger.warning("[BaiduFetcher] finance.baidu.com Cookie 获取异常: BAIDUID 未设置")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[BaiduFetcher] finance.baidu.com Cookie 获取失败: {e}")
 
     def _enforce_rate_limit(self) -> None:
         """速率限制：随机休眠"""
@@ -739,6 +769,270 @@ class BaiduFetcher(BaseFetcher):
             logger.warning(f"[BaiduFetcher] 所属板块解析异常: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # 指数 / 市场统计 / 板块排行
+    # ------------------------------------------------------------------
+
+    def get_main_indices(self, region: str = "cn") -> Optional[List[Dict[str, Any]]]:
+        """
+        获取主要指数实时行情，仅支持 A 股
+
+        数据来源：百度财经指数行情接口
+        (finance.pae.baidu.com/vapi/v1/getquotation?financeType=index&group=quotation_index_minute)
+        """
+        if region != "cn":
+            return None
+
+        # 主要指数代码映射（key 与 AkshareFetcher 保持一致）
+        indices_map = {
+            'sh000001': '上证指数',
+            'sz399001': '深证成指',
+            'sz399006': '创业板指',
+            'sh000688': '科创50',
+            'sh000016': '上证50',
+            'sh000300': '沪深300',
+        }
+
+        self._ensure_finance_cookies()
+
+        results = []
+        for full_code, default_name in indices_map.items():
+            pure_code = full_code[2:]  # 去掉 sh/sz 前缀
+            prefix = full_code[:2]     # sh 或 sz
+            try:
+                self._enforce_rate_limit()
+
+                url = (
+                    f"{BAIDU_FINANCE_API_URL}?"
+                    f"srcid=5353&all=1&pointType=string"
+                    f"&code={pure_code}&query={pure_code}"
+                    f"&eprop=min&financeType=index"
+                    f"&group=quotation_index_minute&market_type=ab"
+                    f"&finClientType=pc&finClientType=pc"
+                )
+                headers = {
+                    'Referer': f"https://finance.baidu.com/stock/{prefix}-{pure_code}",
+                }
+
+                response = self._session.get(
+                    url, headers=headers, timeout=_DEFAULT_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.RequestException as e:
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                    self._session_cookies_ready = False
+                    self._finance_cookies_ready = False
+                logger.warning(f"[BaiduFetcher] 获取指数 {default_name}({full_code}) 请求失败: {e}")
+                continue
+            except ValueError as e:
+                logger.warning(f"[BaiduFetcher] 获取指数 {default_name}({full_code}) JSON 解析失败: {e}")
+                continue
+
+            try:
+                result = data.get('Result', {})
+                if not result:
+                    logger.debug(f"[BaiduFetcher] 指数 {default_name}({full_code}) Result 为空")
+                    continue
+
+                basic = result.get('basicinfos', {})
+                cur = result.get('cur', {})
+                pankou_list = result.get('pankouinfos', {}).get('list', [])
+
+                current = safe_float(cur.get('price'))
+                prev_close = safe_float(self._parse_pankou_value(pankou_list, 'preClose'))
+                high = safe_float(self._parse_pankou_value(pankou_list, 'high'))
+                low = safe_float(self._parse_pankou_value(pankou_list, 'low'))
+
+                amplitude = 0.0
+                if prev_close > 0:
+                    amplitude = (high - low) / prev_close * 100
+
+                results.append({
+                    'code': full_code,
+                    'name': basic.get('name', default_name),
+                    'current': current,
+                    'change': safe_float(cur.get('increase')),
+                    'change_pct': safe_float(str(cur.get('ratio', '')).replace('%', '')),
+                    'open': safe_float(self._parse_pankou_value(pankou_list, 'open')),
+                    'high': high,
+                    'low': low,
+                    'prev_close': prev_close,
+                    'volume': safe_int(self._parse_pankou_value(pankou_list, 'volume')),
+                    'amount': safe_float(self._parse_pankou_value(pankou_list, 'amount')),
+                    'amplitude': amplitude,
+                })
+
+            except Exception as e:
+                logger.warning(f"[BaiduFetcher] 获取指数 {default_name}({full_code}) 行情失败: {e}")
+                continue
+
+        return results if results else None
+
+    # ------------------------------------------------------------------
+
+    def _parse_amount_str(self, amount_str: str) -> float:
+        """解析百度金额字符串（如 '2.59万亿'、'358亿'）为亿元"""
+        amount_str = amount_str.strip()
+        if not amount_str:
+            return 0.0
+        m = re.match(r'([\d.]+)(万亿|亿|万)?', amount_str)
+        if not m:
+            return 0.0
+        value = float(m.group(1))
+        unit = m.group(2) or ''
+        if unit == '万亿':
+            return value * 10000
+        elif unit == '亿':
+            return value
+        elif unit == '万':
+            return value / 10000
+        return value
+
+    def get_market_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        获取市场涨跌统计
+
+        数据来源：百度财经 marketquote 接口
+        (finance.pae.baidu.com/sapi/v1/marketquote?bizType=chgdiagram)
+        """
+        # 手动拼接 URL 以支持 finClientType=pc 重复两次
+        url = (
+            f"{_BAIDU_MARKET_QUOTE_URL}?"
+            f"bizType=chgdiagram&market=ab"
+            f"&finClientType=pc&finClientType=pc"
+        )
+
+        self._ensure_finance_cookies()
+        self._enforce_rate_limit()
+
+        try:
+            headers = {
+                'Referer': 'https://finance.baidu.com/',
+            }
+            response = self._session.get(
+                url, headers=headers, timeout=_DEFAULT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                self._session_cookies_ready = False
+                self._finance_cookies_ready = False
+            logger.error(f"[BaiduFetcher] 获取市场涨跌统计失败: {e}")
+            return None
+        except ValueError as e:
+            logger.error(f"[BaiduFetcher] 获取市场涨跌统计 JSON 解析失败: {e}")
+            return None
+
+        try:
+            result = data.get('Result', {})
+            chg = result.get('chgdiagram', {})
+
+            ratio = chg.get('ratio', {})
+            up_count = ratio.get('up', 0)
+            down_count = ratio.get('down', 0)
+            flat_count = ratio.get('balance', 0)
+
+            # 从 diagram 提取涨跌停数量
+            diagram = chg.get('diagram', [])
+            limit_up_count = 0
+            limit_down_count = 0
+            for item in diagram:
+                title = item.get('title', '')
+                if title == '涨停':
+                    limit_up_count = item.get('count', 0)
+                elif title == '跌停':
+                    limit_down_count = item.get('count', 0)
+
+            # 成交额
+            total_info = chg.get('total', {})
+            total_amount = self._parse_amount_str(total_info.get('price', '0'))
+
+            return {
+                'up_count': up_count,
+                'down_count': down_count,
+                'flat_count': flat_count,
+                'limit_up_count': limit_up_count,
+                'limit_down_count': limit_down_count,
+                'total_amount': total_amount,
+            }
+        except Exception as e:
+            logger.error(f"[BaiduFetcher] 解析市场涨跌统计失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+
+    def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """
+        获取行业板块涨跌榜
+
+        数据来源：百度财经板块接口
+        (finance.pae.baidu.com/vapi/v2/blocks?typeCode=HY)
+
+        Args:
+            n: 返回前N/后N个板块，默认5
+
+        Returns:
+            (涨幅前N板块, 跌幅前N板块) 或 None
+        """
+        base_url = _BAIDU_BLOCKS_RANK_URL
+
+        def _fetch_sectors(sort_type: str) -> Optional[List[Dict]]:
+            # 手动拼接 URL 以支持 finClientType=pc 重复两次
+            url = (
+                f"{base_url}?"
+                f"style=tablelist&pn=0&rn={n}"
+                f"&market=ab&typeCode=HY"
+                f"&sortKey=pxChangeRate&sortType={sort_type}"
+                f"&finClientType=pc&finClientType=pc"
+            )
+            self._enforce_rate_limit()
+            try:
+                headers = {
+                    'Referer': 'https://finance.baidu.com/',
+                }
+                response = self._session.get(
+                    url, headers=headers, timeout=_DEFAULT_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.RequestException as e:
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                    self._session_cookies_ready = False
+                    self._finance_cookies_ready = False
+                logger.error(f"[BaiduFetcher] 获取板块排行(sort={sort_type})失败: {e}")
+                return None
+            except ValueError as e:
+                logger.error(f"[BaiduFetcher] 获取板块排行(sort={sort_type}) JSON 解析失败: {e}")
+                return None
+
+            try:
+                body = data.get('Result', {}).get('list', {}).get('body', [])
+                if not body:
+                    return []
+                sectors = []
+                for item in body:
+                    rate_str = item.get('pxChangeRate', '0%').replace('%', '').replace('+', '')
+                    sectors.append({
+                        'name': item.get('name', ''),
+                        'change_pct': _safe_float(rate_str),
+                    })
+                return sectors
+            except Exception as e:
+                logger.error(f"[BaiduFetcher] 解析板块排行失败: {e}")
+                return None
+
+        self._ensure_finance_cookies()
+
+        top_sectors = _fetch_sectors('desc')
+        bottom_sectors = _fetch_sectors('asc')
+
+        if top_sectors is None and bottom_sectors is None:
+            return None
+
+        return (top_sectors or [], bottom_sectors or [])
+
 if __name__ == "__main__":
 
     # 测试代码
@@ -832,3 +1126,53 @@ if __name__ == "__main__":
             print("[所属板块] 未获取到数据")
     except Exception as e:
         print(f"[所属板块] 获取失败: {e}")
+
+    # 测试主要指数行情
+    print("\n" + "=" * 50)
+    print("测试主要指数行情获取")
+    print("=" * 50)
+    try:
+        indices = fetcher.get_main_indices()
+        if indices:
+            print(f"[主要指数] 获取到 {len(indices)} 个指数:")
+            for idx in indices:
+                print(f"  {idx['name']}({idx['code']}): {idx['current']:.2f} "
+                      f"涨跌幅={idx['change_pct']:.2f}% 振幅={idx['amplitude']:.2f}%")
+        else:
+            print("[主要指数] 未获取到数据")
+    except Exception as e:
+        print(f"[主要指数] 获取失败: {e}")
+
+    # 测试市场涨跌统计
+    print("\n" + "=" * 50)
+    print("测试市场涨跌统计获取")
+    print("=" * 50)
+    try:
+        stats = fetcher.get_market_stats()
+        if stats:
+            print(f"[市场统计] 涨:{stats['up_count']} 跌:{stats['down_count']} 平:{stats['flat_count']}")
+            print(f"  涨停:{stats['limit_up_count']} 跌停:{stats['limit_down_count']}")
+            print(f"  成交额:{stats['total_amount']:.0f}亿")
+        else:
+            print("[市场统计] 未获取到数据")
+    except Exception as e:
+        print(f"[市场统计] 获取失败: {e}")
+
+    # 测试行业板块排行
+    print("\n" + "=" * 50)
+    print("测试行业板块涨跌榜获取")
+    print("=" * 50)
+    try:
+        top, bottom = fetcher.get_sector_rankings(5)
+        if top:
+            print("[领涨板块]:")
+            for s in top:
+                print(f"  {s['name']}: {s['change_pct']:.2f}%")
+        if bottom:
+            print("[领跌板块]:")
+            for s in bottom:
+                print(f"  {s['name']}: {s['change_pct']:.2f}%")
+        if not top and not bottom:
+            print("[板块排行] 未获取到数据")
+    except Exception as e:
+        print(f"[板块排行] 获取失败: {e}")
