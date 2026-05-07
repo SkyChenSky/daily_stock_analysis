@@ -3552,6 +3552,11 @@ class SearchService:
         )
 
         # 构建搜索查询（优化搜索效果）
+        # 大盘搜索使用000001（上证指数）获取更精准的资讯
+        if stock_code == "market":
+            stock_code = "000001"
+            stock_name = "上证指数"
+
         is_foreign = self._is_foreign_stock(stock_code)
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
@@ -3738,7 +3743,12 @@ class SearchService:
                 event_types = ["earnings report", "insider selling", "quarterly results"]
             else:
                 event_types = ["年报预告", "减持公告", "业绩快报"]
-        
+
+        # 大盘搜索使用000001（上证指数）获取更精准的资讯
+        if stock_code == "market":
+            stock_code = "000001"
+            stock_name = "上证指数"
+
         # 构建针对性查询
         event_query = " OR ".join(event_types)
         query = f"{stock_name} ({event_query})"
@@ -3750,8 +3760,8 @@ class SearchService:
             if not provider.is_available:
                 continue
             
-            response = provider.search(query, max_results=5)
-            
+            response = provider.search(query, max_results=5, stock_code=stock_code)
+
             if response.success:
                 return response
         
@@ -3787,6 +3797,11 @@ class SearchService:
         """
         results = {}
         search_count = 0
+
+        # 大盘搜索使用000001（上证指数）获取更精准的资讯
+        if stock_code == "market":
+            stock_code = "000001"
+            stock_name = "上证指数"
 
         is_foreign = self._is_foreign_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
@@ -4092,11 +4107,16 @@ class SearchService:
             )
         
         logger.info(f"[增强搜索] 数据源失败，启动增强搜索: {stock_name}({stock_code})")
-        
+
+        # 大盘搜索使用000001（上证指数）获取更精准的资讯
+        if stock_code == "market":
+            stock_code = "000001"
+            stock_name = "上证指数"
+
         all_results = []
         seen_urls = set()
         successful_providers = []
-        
+
         # 使用多个关键词模板搜索
         is_foreign = self._is_foreign_stock(stock_code)
         keywords = self.ENHANCED_SEARCH_KEYWORDS_EN if is_foreign else self.ENHANCED_SEARCH_KEYWORDS
@@ -4111,7 +4131,7 @@ class SearchService:
                     continue
                 
                 try:
-                    response = provider.search(query, max_results=3)
+                    response = provider.search(query, max_results=3, stock_code=stock_code)
                     
                     if response.success and response.results:
                         # 去重并添加结果
@@ -4284,7 +4304,7 @@ if __name__ == "__main__":
     
     if service.is_available:
         print("=== 测试股票新闻搜索 ===")
-        response = service.search_stock_news("002497", "雅化集团")
+        response = service.search_stock_news("market", "大盘")
         print(f"搜索状态: {'成功' if response.success else '失败'}")
         print(f"搜索引擎: {response.provider}")
         print(f"结果数量: {len(response.results)}")
