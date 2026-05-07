@@ -1032,7 +1032,46 @@ class EfinanceFetcher(BaseFetcher):
         except Exception as e:
             logger.error(f"[efinance] 获取板块排行失败: {e}")
             return None
-    
+
+    def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """
+        获取概念板块涨跌榜 (efinance)
+        """
+        import efinance as ef
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ef.stock.get_realtime_quotes(['概念板块']) 获取概念板块行情...")
+            df = _ef_call_with_timeout(ef.stock.get_realtime_quotes, ['概念板块'])
+            if df is None or df.empty:
+                logger.warning("[efinance] 概念板块行情数据为空")
+                return None
+
+            change_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
+            name_col = '股票名称' if '股票名称' in df.columns else 'name'
+            if change_col not in df.columns or name_col not in df.columns:
+                return None
+
+            df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+            df = df.dropna(subset=[change_col])
+            top = df.nlargest(n, change_col)
+            bottom = df.nsmallest(n, change_col)
+
+            top_concepts = [
+                {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                for _, row in top.iterrows()
+            ]
+            bottom_concepts = [
+                {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                for _, row in bottom.iterrows()
+            ]
+            return top_concepts, bottom_concepts
+        except Exception as e:
+            logger.error(f"[efinance] 获取概念板块排行失败: {e}")
+            return None
+
     def get_base_info(self, stock_code: str) -> Optional[Dict[str, Any]]:
         """
         获取股票基本信息

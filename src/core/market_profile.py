@@ -25,6 +25,8 @@ class MarketProfile:
     has_market_stats: bool
     # 市场概况是否包含板块涨跌（A 股有，美股暂无）
     has_sector_rankings: bool
+    # 市场概况是否包含概念板块涨跌（A 股有，美股暂无）
+    has_concept_rankings: bool
 
 
 CN_PROFILE = MarketProfile(
@@ -38,6 +40,7 @@ CN_PROFILE = MarketProfile(
     prompt_index_hint="分析上证、深证、创业板等各指数走势特点",
     has_market_stats=True,
     has_sector_rankings=True,
+    has_concept_rankings=True,
 )
 
 US_PROFILE = MarketProfile(
@@ -51,6 +54,7 @@ US_PROFILE = MarketProfile(
     prompt_index_hint="分析标普500、纳斯达克、道指等各指数走势特点",
     has_market_stats=False,
     has_sector_rankings=False,
+    has_concept_rankings=False,
 )
 
 

@@ -90,6 +90,10 @@ class MarketOverview:
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
 
+    # 概念板块涨幅榜
+    top_concepts: List[Dict] = field(default_factory=list)     # 涨幅前5概念板块
+    bottom_concepts: List[Dict] = field(default_factory=list)  # 跌幅前5概念板块
+
 
 class MarketAnalyzer:
     """
@@ -255,8 +259,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
-        
-        # 4. 获取北向资金（可选）
+
+        # 4. 获取概念板块涨跌榜（A 股有，美股暂无）
+        if self.profile.has_concept_rankings:
+            self._get_concept_rankings(overview)
+
+        # 5. 获取北向资金（可选）
         # self._get_north_flow(overview)
         
         return overview
@@ -338,6 +346,23 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
+
+    def _get_concept_rankings(self, overview: MarketOverview):
+        """获取概念板块涨跌榜"""
+        try:
+            logger.info("[大盘] 获取概念板块涨跌榜...")
+
+            top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5)
+
+            if top_concepts or bottom_concepts:
+                overview.top_concepts = top_concepts
+                overview.bottom_concepts = bottom_concepts
+
+                logger.info(f"[大盘] 领涨概念: {[c['name'] for c in overview.top_concepts]}")
+                logger.info(f"[大盘] 领跌概念: {[c['name'] for c in overview.bottom_concepts]}")
+
+        except Exception as e:
+            logger.error(f"[大盘] 获取概念板块涨跌榜失败: {e}")
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -435,6 +460,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         stats_block = self._build_stats_block(overview)
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview)
+        concept_block = self._build_concept_block(overview)
         patterns = (
             _ENGLISH_SECTION_PATTERNS
             if self._get_review_language() == "en"
@@ -460,6 +486,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 review,
                 patterns["sector_highlights"],
                 sector_block,
+            )
+
+        if concept_block:
+            review = self._insert_after_section(
+                review,
+                patterns["sector_highlights"],
+                concept_block,
             )
 
         return review
@@ -547,6 +580,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append(f"> 💧 领跌: {bot}")
         return "\n".join(lines)
 
+    def _build_concept_block(self, overview: MarketOverview) -> str:
+        """Build concept / theme ranking block."""
+        if not overview.top_concepts and not overview.bottom_concepts:
+            return ""
+        lines = []
+        if overview.top_concepts:
+            top = " | ".join(
+                [f"**{c['name']}**({c['change_pct']:+.2f}%)" for c in overview.top_concepts[:5]]
+            )
+            if self._get_review_language() == "en":
+                lines.append(f"> 🔥 Top Concepts: {top}")
+            else:
+                lines.append(f"> 🔥 领涨概念: {top}")
+        if overview.bottom_concepts:
+            bot = " | ".join(
+                [f"**{c['name']}**({c['change_pct']:+.2f}%)" for c in overview.bottom_concepts[:5]]
+            )
+            if self._get_review_language() == "en":
+                lines.append(f"> 💧 Bottom Concepts: {bot}")
+            else:
+                lines.append(f"> 💧 领跌概念: {bot}")
+        return "\n".join(lines)
+
     def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
@@ -558,8 +614,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
         
         # 板块信息
-        top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
-        bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:3]])
+        top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:5]])
+        bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:5]])
+
+        # 概念板块信息
+        top_concepts_text = ", ".join([f"{c['name']}({c['change_pct']:+.2f}%)" for c in overview.top_concepts[:5]])
+        bottom_concepts_text = ", ".join([f"{c['name']}({c['change_pct']:+.2f}%)" for c in overview.bottom_concepts[:5]])
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
@@ -576,6 +636,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 按 region 组装市场概况与板块区块（美股无涨跌家数、板块数据）
         stats_block = ""
         sector_block = ""
+        concept_block = ""
         if review_language == "en":
             if self.profile.has_market_stats:
                 stats_block = f"""## Market Breadth
@@ -591,6 +652,11 @@ Leading: {top_sectors_text if top_sectors_text else "N/A"}
 Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
             else:
                 sector_block = "## Sector Performance\n(US sector data not available.)"
+
+            if self.profile.has_concept_rankings:
+                concept_block = f"""## Concept / Theme Performance
+Leading: {top_concepts_text if top_concepts_text else "N/A"}
+Lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
         else:
             if self.profile.has_market_stats:
                 stats_block = f"""## 市场概况
@@ -606,6 +672,11 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}"""
             else:
                 sector_block = "## 板块表现\n（美股暂无板块涨跌数据）"
+
+            if self.profile.has_concept_rankings:
+                concept_block = f"""## 概念板块表现
+领涨: {top_concepts_text if top_concepts_text else "暂无数据"}
+领跌: {bottom_concepts_text if bottom_concepts_text else "暂无数据"}"""
 
         data_no_indices_hint = (
             "注意：由于行情数据获取失败，请主要根据【市场新闻】进行定性分析和总结，不要编造具体的指数点位。"
@@ -648,6 +719,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 {stats_block}
 
 {sector_block}
+
+{concept_block}
 
 ## Market News
 {news_placeholder}
@@ -711,6 +784,8 @@ Output the report content directly, no extra commentary.
 
 {sector_block}
 
+{concept_block}
+
 ## 市场新闻
 {news_placeholder}
 
@@ -734,7 +809,7 @@ Output the report content directly, no extra commentary.
 （解读成交额流向的含义）
 
 ### 四、热点解读
-（分析领涨领跌板块背后的逻辑和驱动因素）
+（分析领涨领跌板块及概念板块背后的逻辑和驱动因素）
 
 ### 五、后市展望
 （结合当前走势和新闻，给出明日市场预判）
@@ -785,8 +860,12 @@ Output the report content directly, no extra commentary.
         
         # 板块信息
         separator = ", " if template_language == "en" else "、"
-        top_text = separator.join([s['name'] for s in overview.top_sectors[:3]])
-        bottom_text = separator.join([s['name'] for s in overview.bottom_sectors[:3]])
+        top_text = separator.join([s['name'] for s in overview.top_sectors[:5]])
+        bottom_text = separator.join([s['name'] for s in overview.bottom_sectors[:5]])
+
+        # 概念板块信息
+        top_concept_text = separator.join([c['name'] for c in overview.top_concepts[:5]])
+        bottom_concept_text = separator.join([c['name'] for c in overview.bottom_concepts[:5]])
 
         if template_language == "en":
             stats_section = ""
@@ -808,6 +887,13 @@ Output the report content directly, no extra commentary.
 - **Leaders**: {top_text or "N/A"}
 - **Laggards**: {bottom_text or "N/A"}
 """
+            concept_section = ""
+            if self.profile.has_concept_rankings and (top_concept_text or bottom_concept_text):
+                concept_section = f"""
+### 4b. Concept / Theme Highlights
+- **Leaders**: {top_concept_text or "N/A"}
+- **Laggards**: {bottom_concept_text or "N/A"}
+"""
             market_name = "US Market Recap" if self.region == "us" else "A-share Market Recap"
             report = f"""## {overview.date} {market_name}
 
@@ -818,6 +904,7 @@ Today's {self._get_market_scope_name(template_language)} showed **{market_mood}*
 {indices_text or "- No index data available"}
 {stats_section}
 {sector_section}
+{concept_section}
 ### 5. Risk Alerts
 Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
 
@@ -847,6 +934,13 @@ Market conditions can change quickly. The data above is for reference only and d
 - **领涨**: {top_text}
 - **领跌**: {bottom_text}
 """
+        concept_section = ""
+        if self.profile.has_concept_rankings and (top_concept_text or bottom_concept_text):
+            concept_section = f"""
+### 四（2）、概念板块表现
+- **领涨**: {top_concept_text}
+- **领跌**: {bottom_concept_text}
+"""
         market_label = "A股" if self.region == "cn" else "美股"
         strategy_summary = self._get_strategy_markdown_block(template_language)
         return f"""## {overview.date} 大盘复盘
@@ -858,6 +952,7 @@ Market conditions can change quickly. The data above is for reference only and d
 {indices_text}
 {stats_section}
 {sector_section}
+{concept_section}
 ### 五、风险提示
 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 

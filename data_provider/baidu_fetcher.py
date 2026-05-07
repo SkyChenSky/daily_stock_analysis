@@ -1033,6 +1033,75 @@ class BaiduFetcher(BaseFetcher):
 
         return (top_sectors or [], bottom_sectors or [])
 
+    def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """
+        获取概念板块涨跌榜
+
+        数据来源：百度财经板块接口
+        (finance.pae.baidu.com/vapi/v2/blocks?typeCode=GN)
+
+        Args:
+            n: 返回前N/后N个板块，默认5
+
+        Returns:
+            (涨幅前N概念板块, 跌幅前N概念板块) 或 None
+        """
+        base_url = _BAIDU_BLOCKS_RANK_URL
+
+        def _fetch_concepts(sort_type: str) -> Optional[List[Dict]]:
+            url = (
+                f"{base_url}?"
+                f"style=tablelist&pn=0&rn={n}"
+                f"&market=ab&typeCode=GN"
+                f"&sortKey=pxChangeRate&sortType={sort_type}"
+                f"&finClientType=pc&finClientType=pc"
+            )
+            self._enforce_rate_limit()
+            try:
+                headers = {
+                    'Referer': 'https://finance.baidu.com/',
+                }
+                response = self._session.get(
+                    url, headers=headers, timeout=_DEFAULT_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.RequestException as e:
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+                    self._session_cookies_ready = False
+                    self._finance_cookies_ready = False
+                logger.error(f"[BaiduFetcher] 获取概念板块排行(sort={sort_type})失败: {e}")
+                return None
+            except ValueError as e:
+                logger.error(f"[BaiduFetcher] 获取概念板块排行(sort={sort_type}) JSON 解析失败: {e}")
+                return None
+
+            try:
+                body = data.get('Result', {}).get('list', {}).get('body', [])
+                if not body:
+                    return []
+                concepts = []
+                for item in body:
+                    rate_str = item.get('pxChangeRate', '0%').replace('%', '').replace('+', '')
+                    concepts.append({
+                        'name': item.get('name', ''),
+                        'change_pct': _safe_float(rate_str),
+                    })
+                return concepts
+            except Exception as e:
+                logger.error(f"[BaiduFetcher] 解析概念板块排行失败: {e}")
+                return None
+
+        self._ensure_finance_cookies()
+
+        top_concepts = _fetch_concepts('desc')
+        bottom_concepts = _fetch_concepts('asc')
+
+        if top_concepts is None and bottom_concepts is None:
+            return None
+
+        return (top_concepts or [], bottom_concepts or [])
+
 if __name__ == "__main__":
 
     # 测试代码

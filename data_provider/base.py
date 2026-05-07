@@ -2530,3 +2530,63 @@ class DataFetcherManager:
             return top, bottom
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
         return [], []
+
+    def _get_concept_rankings_with_meta(
+            self,
+            n: int = 5,
+        ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
+            """Get concept rankings with ordered fallback chain metadata."""
+            source_chain: List[Dict[str, Any]] = []
+            last_error = ""
+
+            for fetcher in self._fetchers:
+                if not hasattr(fetcher, 'get_concept_rankings'):
+                    continue
+
+                start = time.time()
+                try:
+                    data = fetcher.get_concept_rankings(n)
+                    duration_ms = int((time.time() - start) * 1000)
+                    if data and data[0] is not None and data[1] is not None:
+                        source_chain.append(
+                            {
+                                "provider": fetcher.name,
+                                "result": "ok",
+                                "duration_ms": duration_ms,
+                            }
+                        )
+                        logger.info(f"[{fetcher.name}] 获取概念板块排行成功")
+                        return data[0], data[1], source_chain, ""
+
+                    last_error = f"{fetcher.name}返回空结果"
+                    source_chain.append(
+                        {
+                            "provider": fetcher.name,
+                            "result": "empty",
+                            "duration_ms": duration_ms,
+                            "error": last_error,
+                        }
+                    )
+                except Exception as e:
+                    error_type, error_reason = summarize_exception(e)
+                    last_error = f"{fetcher.name} ({error_type}) {error_reason}"
+                    duration_ms = int((time.time() - start) * 1000)
+                    source_chain.append(
+                        {
+                            "provider": fetcher.name,
+                            "result": "failed",
+                            "duration_ms": duration_ms,
+                            "error": error_reason,
+                        }
+                    )
+                    logger.warning(f"[{fetcher.name}] 获取概念板块排行失败: {error_reason}")
+
+            return [], [], source_chain, last_error
+
+    def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+        """获取概念板块涨跌榜（自动切换数据源）"""
+        top, bottom, _, last_error = self._get_concept_rankings_with_meta(n)
+        if top or bottom:
+            return top, bottom
+        logger.warning(f"[概念板块排行] 所有数据源均失败，最终错误: {last_error}")
+        return [], []

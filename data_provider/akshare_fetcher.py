@@ -1813,6 +1813,46 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
             return None
 
+    def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """
+        获取概念板块涨跌榜
+
+        数据源：东财接口 (ak.stock_board_concept_name_em)
+        """
+        import akshare as ak
+
+        def _get_rank_top_n(df: pd.DataFrame, change_col: str, name_col: str, n: int) -> Tuple[list, list]:
+            df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+            df = df.dropna(subset=[change_col])
+
+            top = df.nlargest(n, change_col)
+            top_concepts = [
+                {'name': row[name_col], 'change_pct': row[change_col]}
+                for _, row in top.iterrows()
+            ]
+
+            bottom = df.nsmallest(n, change_col)
+            bottom_concepts = [
+                {'name': row[name_col], 'change_pct': row[change_col]}
+                for _, row in bottom.iterrows()
+            ]
+            return top_concepts, bottom_concepts
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_board_concept_name_em() 获取概念板块排行...")
+            df = ak.stock_board_concept_name_em()
+            if df is not None and not df.empty:
+                change_col = '涨跌幅'
+                name = '板块名称'
+                return _get_rank_top_n(df, change_col, name, n)
+
+        except Exception as e:
+            logger.error(f"[Akshare] 获取概念板块排行失败: {e}")
+            return None
+
 
 if __name__ == "__main__":
     # 测试代码
