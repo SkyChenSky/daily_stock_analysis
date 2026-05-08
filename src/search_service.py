@@ -2396,6 +2396,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
     def _fetch_widget_news(
         self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
         subtypes: Optional[Set[str]] = None,
+        stock_name: Optional[str] = None,
     ) -> Optional[List[SearchResult]]:
         """源2: 组件新闻/公告/研报 — /api/stockwidget 接口
 
@@ -2405,6 +2406,8 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
         Args:
             subtypes: 指定只提取哪些子类型，如 {"news", "fastNews"}；
                       未指定则提取全部（向后兼容）。
+            stock_name: 股票名称；提供后对 news 段结果做标题相关性过滤，
+                        标题中必须包含 stock_name 或 stock_code，否则跳过。
         """
         results: List[SearchResult] = []
         try:
@@ -2453,6 +2456,11 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     title = item.get("title", "")
                     if not title:
                         continue
+
+                    # news 段可能混入无关股票新闻，按标题相关性过滤
+                    if key == "news" and stock_name:
+                        if stock_name not in title and stock_code not in title:
+                            continue
 
                     evaluate = item.get("evaluate", "")
                     content_items = (item.get("content") or {}).get("items") or []
@@ -2738,6 +2746,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
         dimension = kwargs.get("dimension")
         dim_cfg = self._DIMENSION_SOURCES.get(dimension) if dimension else None
+        stock_name = kwargs.get("stock_name")
 
         try:
             headers = self._build_headers()
@@ -2764,6 +2773,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     widget = self._fetch_widget_news(
                         stock_code, self._PER_SOURCE_LIMIT, cutoff, headers,
                         subtypes=widget_subtypes,
+                        stock_name=stock_name,
                     )
                     if widget is None:
                         source_errors += 1
@@ -4041,6 +4051,7 @@ class SearchService:
                     days=search_days,
                     stock_code=stock_code,
                     dimension=dim['name'],
+                    stock_name=stock_name,
                 )
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
