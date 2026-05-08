@@ -417,7 +417,20 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     all_news.extend(response.results)
                     logger.info(f"[大盘] 搜索 '{query}' 获取 {len(response.results)} 条结果")
             
-            logger.info(f"[大盘] 共获取 {len(all_news)} 条市场新闻")
+            # 去重（优先按 url，无 url 则按 title）
+            seen = set()
+            unique_news = []
+            for item in all_news:
+                if isinstance(item, dict):
+                    key = item.get('url') or item.get('title')
+                else:
+                    key = getattr(item, 'url', None) or getattr(item, 'title', None)
+                if key and key not in seen:
+                    seen.add(key)
+                    unique_news.append(item)
+
+            logger.info(f"[大盘] 共获取 {len(all_news)} 条市场新闻，去重后 {len(unique_news)} 条")
+            all_news = unique_news
             
         except Exception as e:
             logger.error(f"[大盘] 搜索市场新闻失败: {e}")
@@ -1009,5 +1022,13 @@ if __name__ == "__main__":
     
     # 测试生成模板报告
     report = analyzer._generate_template_review(overview, [])
+
     print(f"\n=== 复盘报告 ===")
     print(report)
+
+    news = analyzer.search_market_news()
+    print(news)
+    
+    # 生成LLM复盘报告
+    llmreport = analyzer.generate_market_review(overview, news)
+    print(llmreport)
