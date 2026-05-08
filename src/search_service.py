@@ -2681,6 +2681,129 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
         return results
 
+    def _fetch_financial_notices(
+        self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+    ) -> Optional[List[SearchResult]]:
+        """源4: 财务报告 — 两步获取（列表 + 详情）
+
+        第一步: resource_id=5355 获取财务报告列表（标题、日期、locate_url）
+        第二步: resource_id=5346 用 locate_url 获取报告全文内容
+        """
+        results: List[SearchResult] = []
+        try:
+            # --- 第一步: 获取财务报告列表 ---
+            list_resp = _get_with_retry(
+                self._BAIDU_REPORT_URL,
+                headers=headers,
+                params={
+                    "resource_id": "5355",
+                    "group": "stock_ab_notice",
+                    "classifiName": "财务报告",
+                    "type": "6",
+                    "code": stock_code,
+                    "market": "ab",
+                    "query": stock_code,
+                    "pn": "0",
+                    "rn": str(max_results * 2),
+                    "finClientType": "pc",
+                },
+                timeout=10,
+            )
+            list_resp.raise_for_status()
+            list_payload = list_resp.json()
+
+            notice_list = (
+                list_payload.get("Result", [{}])[0]
+                .get("DisplayData", {})
+                .get("resultData", {})
+                .get("tplData", {})
+                .get("result", {})
+                .get("lists", [])
+            )
+
+            for notice in notice_list:
+                if len(results) >= max_results:
+                    break
+
+                title = notice.get("title", "")
+                if not title:
+                    continue
+
+                # 解析发布时间（时间戳格式）
+                publish_time = notice.get("publish_time", "")
+                published_date = ""
+                if publish_time:
+                    try:
+                        dt = datetime.fromtimestamp(int(publish_time))
+                        if dt < cutoff:
+                            continue
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, OSError):
+                        pass
+
+                # 提取 PDF 链接
+                appendix = notice.get("appendix")
+                pdf_url = ""
+                if isinstance(appendix, dict):
+                    pdf_url = appendix.get("url", "")
+                elif isinstance(appendix, list) and appendix:
+                    pdf_url = appendix[0].get("url", "")
+
+                locate_url = notice.get("locate_url", "")
+                classifi = notice.get("classifiName", "")
+
+                # --- 第二步: 获取报告详情全文 ---
+                snippet = f"【财务报告】{classifi}" if classifi else "【财务报告】"
+                if locate_url:
+                    try:
+                        # locate_url 包含完整API参数: resource_id=5346&group=8670&query=...&code=...&market=...
+                        detail_params = dict(
+                            pair.split("=", 1)
+                            for pair in locate_url.split("&")
+                            if "=" in pair
+                        )
+                        detail_params["finClientType"] = "pc"
+                        detail_resp = _get_with_retry(
+                            self._BAIDU_REPORT_URL,
+                            headers=headers,
+                            params=detail_params,
+                            timeout=10,
+                        )
+                        detail_resp.raise_for_status()
+                        detail_payload = detail_resp.json()
+
+                        content_items = (
+                            detail_payload.get("Result", [{}])[0]
+                            .get("DisplayData", {})
+                            .get("resultData", {})
+                            .get("tplData", {})
+                            .get("result", {})
+                            .get("content", {})
+                            .get("items", [])
+                        )
+                        if content_items:
+                            full_text = "".join(
+                                item.get("data", "") for item in content_items
+                            )
+                            if full_text:
+                                snippet = full_text[:1500]
+                    except Exception as e:
+                        logger.debug("[BaiduFinance] 财务报告详情获取失败(%s): %s", title[:20], e)
+
+                results.append(SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=pdf_url,
+                    source=classifi or "财务报告",
+                    published_date=published_date,
+                ))
+
+        except Exception as e:
+            logger.warning("[BaiduFinance] 财务报告源失败: %s", e)
+            return None
+
+        return results
+
     # ------------------------------------------------------------------
     # 去重合并
     # ------------------------------------------------------------------
@@ -2718,7 +2841,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
         "announcements":    {"sentiment": False, "widget_subtypes": {"noticeNews"},                  "reports": False},
         "market_analysis":  {"sentiment": False, "widget_subtypes": {"reportNews"},                  "reports": True},
         "risk_check":       {"sentiment": True,  "widget_subtypes": {"news"},                        "reports": False, "benefit_type": -1},
-        "earnings":         {"sentiment": False, "widget_subtypes": {"news", "noticeNews"},          "reports": False},
+        "earnings":         {"sentiment": False, "widget_subtypes": {"news", "noticeNews"},          "reports": False, "notices": True, "days_override": 90},
         "industry":         {"sentiment": False, "widget_subtypes": {"tradeNews"},                   "reports": False},
     }
 
@@ -2750,7 +2873,8 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
         try:
             headers = self._build_headers()
-            cutoff = datetime.now() - timedelta(days=days)
+            dim_days = dim_cfg.get("days_override", days) if dim_cfg else days
+            cutoff = datetime.now() - timedelta(days=dim_days)
             all_results: List[SearchResult] = []
             seen_titles: set = set()
             source_errors = 0
@@ -2786,6 +2910,13 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                         source_errors += 1
                     else:
                         self._merge_results(all_results, seen_titles, reports)
+
+                if dim_cfg.get("notices"):
+                    notices = self._fetch_financial_notices(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
+                    if notices is None:
+                        source_errors += 1
+                    else:
+                        self._merge_results(all_results, seen_titles, notices)
             else:
                 # 无 dimension — 保持原行为（全量获取）
                 sentiment = self._fetch_sentiment_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
@@ -2808,7 +2939,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
             # 判断有效源数量（维度模式下可能只有一个源）
             expected_sources = len([
-                s for s in ("sentiment", "widget_subtypes", "reports")
+                s for s in ("sentiment", "widget_subtypes", "reports", "notices")
                 if dim_cfg.get(s)
             ]) if dim_cfg else 3
 
