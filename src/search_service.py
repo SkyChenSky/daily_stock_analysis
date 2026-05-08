@@ -2533,9 +2533,15 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                             snippet_parts.append(f"【评级: {report_class}】")
                         if change:
                             snippet_parts.append(change)
-                        detail_parts = [p for p in (provider, author, report_type) if p]
-                        if detail_parts:
-                            snippet_parts.append(" · ".join(detail_parts))
+                        # 拼接研报全文内容
+                        content_items = (item.get("content") or {}).get("items") or []
+                        full_text = "".join(ci.get("data", "") for ci in content_items)
+                        if full_text:
+                            snippet_parts.append(full_text)
+                        else:
+                            detail_parts = [p for p in (provider, author, report_type) if p]
+                            if detail_parts:
+                                snippet_parts.append(" · ".join(detail_parts))
                         snippet = "".join(snippet_parts)[:1500]
 
                         results.append(SearchResult(
@@ -2629,13 +2635,17 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             )
 
             for report in report_list:
-                # 解析发布时间 (YYYYMMDD 格式)
+                # 解析发布时间（时间戳或 YYYYMMDD 格式）
                 raw_time = report.get("publish_time") or report.get("create_time", "")
                 published_date = ""
                 if raw_time:
                     try:
                         raw_str = str(raw_time).strip()
-                        dt = datetime.strptime(raw_str, "%Y%m%d")
+                        dt = None
+                        try:
+                            dt = datetime.fromtimestamp(int(raw_str))
+                        except (ValueError, OSError):
+                            dt = datetime.strptime(raw_str, "%Y%m%d")
                         if dt < cutoff:
                             continue
                         published_date = dt.strftime("%Y-%m-%d")
@@ -2657,9 +2667,15 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     snippet_parts.append(f"【评级: {report_class}】")
                 if change:
                     snippet_parts.append(change)
-                detail_parts = [p for p in (provider, author, report_type) if p]
-                if detail_parts:
-                    snippet_parts.append(" · ".join(detail_parts))
+                # 拼接研报全文内容
+                content_items = (report.get("content") or {}).get("items") or []
+                full_text = "".join(ci.get("data", "") for ci in content_items)
+                if full_text:
+                    snippet_parts.append(full_text)
+                else:
+                    detail_parts = [p for p in (provider, author, report_type) if p]
+                    if detail_parts:
+                        snippet_parts.append(" · ".join(detail_parts))
                 snippet = "".join(snippet_parts)[:1500]
 
                 results.append(SearchResult(
