@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 from itertools import cycle
 from urllib.parse import parse_qsl, unquote, urlparse
 import akshare as ak
@@ -2320,8 +2320,13 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
     def _fetch_sentiment_news(
         self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+        benefit_type: Optional[int] = None,
     ) -> Optional[List[SearchResult]]:
-        """源1: 新闻 — 原有 /vapi/sentimentlist 接口"""
+        """源1: 新闻 — 原有 /vapi/sentimentlist 接口
+
+        Args:
+            benefit_type: 若指定，仅保留 benefitType 等于该值的条目（如 -1 仅保留利空）
+        """
         results: List[SearchResult] = []
         try:
             resp = _get_with_retry(
@@ -2348,6 +2353,12 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             )
 
             for item in result_list:
+                benefit = item.get("benefitType", 0)
+
+                # 按 benefit_type 过滤
+                if benefit_type is not None and benefit != benefit_type:
+                    continue
+
                 publish_time = item.get("publishTime", 0)
                 published_date = ""
                 if publish_time:
@@ -2359,7 +2370,6 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     except (ValueError, OSError):
                         pass
 
-                benefit = item.get("benefitType", 0)
                 benefit_tag = {1: "【利好】", -1: "【利空】"}.get(benefit, "")
 
                 title = item.get("title", "")
@@ -2385,11 +2395,16 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
     def _fetch_widget_news(
         self, stock_code: str, max_results: int, cutoff: datetime, headers: Dict[str, str],
+        subtypes: Optional[Set[str]] = None,
     ) -> Optional[List[SearchResult]]:
         """源2: 组件新闻/公告/研报 — /api/stockwidget 接口
 
         响应路径: Result.content.{news, tradeNews, fastNews, reportNews, noticeNews}
         news/tradeNews/reportNews 为 flat list；noticeNews 为 dict 含 .list。
+
+        Args:
+            subtypes: 指定只提取哪些子类型，如 {"news", "fastNews"}；
+                      未指定则提取全部（向后兼容）。
         """
         results: List[SearchResult] = []
         try:
@@ -2414,7 +2429,10 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                 return results
 
             # --- 个股新闻 (news) + 行业新闻 (tradeNews) ---
-            for key in ("news", "tradeNews"):
+            _widget_keys = ("news", "tradeNews") if subtypes is None else (
+                k for k in ("news", "tradeNews") if k in subtypes
+            )
+            for key in _widget_keys:
                 items = content.get(key, [])
                 if not isinstance(items, list):
                     continue
@@ -2457,35 +2475,83 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     ))
 
             # --- 快讯 (fastNews) — 无 title，用 content 字段 ---
-            fast_items = content.get("fastNews", [])
-            if isinstance(fast_items, list):
-                for item in fast_items:
-                    if len(results) >= max_results:
-                        return results
-                    fast_content = item.get("content", "")
-                    if not fast_content:
-                        continue
-                    # fastNews 没有 publish_time 时间戳，有 time 字段如 "04-14 17:56"
-                    results.append(SearchResult(
-                        title=fast_content[:80],
-                        snippet=fast_content[:1500],
-                        url=item.get("loc", ""),
-                        source="百度快讯",
-                        published_date=item.get("time", ""),
-                    ))
+            if subtypes is None or "fastNews" in subtypes:
+                fast_items = content.get("fastNews", [])
+                if isinstance(fast_items, list):
+                    for item in fast_items:
+                        if len(results) >= max_results:
+                            return results
+                        fast_content = item.get("content", "")
+                        if not fast_content:
+                            continue
+                        # fastNews 没有 publish_time 时间戳，有 time 字段如 "04-14 17:56"
+                        results.append(SearchResult(
+                            title=fast_content[:80],
+                            snippet=fast_content[:1500],
+                            url=item.get("loc", ""),
+                            source="百度快讯",
+                            published_date=item.get("time", ""),
+                        ))
 
             # --- 研报 (reportNews) — 与 /opendata 同结构 ---
-            report_items = content.get("reportNews", [])
-            if isinstance(report_items, list):
-                for item in report_items:
+            if subtypes is None or "reportNews" in subtypes:
+                report_items = content.get("reportNews", [])
+                if isinstance(report_items, list):
+                    for item in report_items:
+                        if len(results) >= max_results:
+                            return results
+                        raw_time = item.get("publish_time") or item.get("create_time", "")
+                        published_date = ""
+                        if raw_time:
+                            try:
+                                raw_str = str(raw_time).strip()
+                                dt = datetime.fromtimestamp(int(raw_str))
+                                if dt < cutoff:
+                                    continue
+                                published_date = dt.strftime("%Y-%m-%d")
+                            except (ValueError, OSError):
+                                pass
+
+                        title = item.get("title", "")
+                        if not title:
+                            continue
+
+                        provider = item.get("provider", "")
+                        report_class = item.get("class", "")
+                        change = item.get("change", "")
+                        author = item.get("author", "")
+                        report_type = item.get("type", "")
+
+                        snippet_parts = ["【研报】"]
+                        if report_class:
+                            snippet_parts.append(f"【评级: {report_class}】")
+                        if change:
+                            snippet_parts.append(change)
+                        detail_parts = [p for p in (provider, author, report_type) if p]
+                        if detail_parts:
+                            snippet_parts.append(" · ".join(detail_parts))
+                        snippet = "".join(snippet_parts)[:1500]
+
+                        results.append(SearchResult(
+                            title=title,
+                            snippet=snippet,
+                            url=item.get("third_url", ""),
+                            source=provider or "研报",
+                            published_date=published_date,
+                        ))
+
+            # --- 公告 (noticeNews) ---
+            if subtypes is None or "noticeNews" in subtypes:
+                notice_data = content.get("noticeNews", {})
+                notice_items = notice_data.get("list") or []
+                for item in notice_items:
                     if len(results) >= max_results:
                         return results
-                    raw_time = item.get("publish_time") or item.get("create_time", "")
+                    publish_time = item.get("publish_time", 0)
                     published_date = ""
-                    if raw_time:
+                    if publish_time:
                         try:
-                            raw_str = str(raw_time).strip()
-                            dt = datetime.fromtimestamp(int(raw_str))
+                            dt = datetime.fromtimestamp(int(publish_time))
                             if dt < cutoff:
                                 continue
                             published_date = dt.strftime("%Y-%m-%d")
@@ -2496,64 +2562,19 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     if not title:
                         continue
 
-                    provider = item.get("provider", "")
-                    report_class = item.get("class", "")
-                    change = item.get("change", "")
-                    author = item.get("author", "")
-                    report_type = item.get("type", "")
+                    classifi = item.get("classifiName", "")
+                    appendix = item.get("appendix") or []
+                    pdf_url = appendix[0].get("url", "") if appendix else ""
 
-                    snippet_parts = ["【研报】"]
-                    if report_class:
-                        snippet_parts.append(f"【评级: {report_class}】")
-                    if change:
-                        snippet_parts.append(change)
-                    detail_parts = [p for p in (provider, author, report_type) if p]
-                    if detail_parts:
-                        snippet_parts.append(" · ".join(detail_parts))
-                    snippet = "".join(snippet_parts)[:1500]
+                    snippet = f"【公告】{classifi}" if classifi else "【公告】"
 
                     results.append(SearchResult(
                         title=title,
-                        snippet=snippet,
-                        url=item.get("third_url", ""),
-                        source=provider or "研报",
+                        snippet=snippet[:1500],
+                        url=pdf_url,
+                        source=classifi or "公司公告",
                         published_date=published_date,
                     ))
-
-            # --- 公告 (noticeNews) ---
-            notice_data = content.get("noticeNews", {})
-            notice_items = notice_data.get("list") or []
-            for item in notice_items:
-                if len(results) >= max_results:
-                    return results
-                publish_time = item.get("publish_time", 0)
-                published_date = ""
-                if publish_time:
-                    try:
-                        dt = datetime.fromtimestamp(int(publish_time))
-                        if dt < cutoff:
-                            continue
-                        published_date = dt.strftime("%Y-%m-%d")
-                    except (ValueError, OSError):
-                        pass
-
-                title = item.get("title", "")
-                if not title:
-                    continue
-
-                classifi = item.get("classifiName", "")
-                appendix = item.get("appendix") or []
-                pdf_url = appendix[0].get("url", "") if appendix else ""
-
-                snippet = f"【公告】{classifi}" if classifi else "【公告】"
-
-                results.append(SearchResult(
-                    title=title,
-                    snippet=snippet[:1500],
-                    url=pdf_url,
-                    source=classifi or "公司公告",
-                    published_date=published_date,
-                ))
 
         except Exception as e:
             logger.warning("[BaiduFinance] 组件新闻源失败: %s", e)
@@ -2681,6 +2702,19 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             all_results.append(r)
 
     # ------------------------------------------------------------------
+    # 维度 → 数据源映射表
+    # ------------------------------------------------------------------
+
+    _DIMENSION_SOURCES = {
+        "latest_news":      {"sentiment": True,  "widget_subtypes": {"news", "fastNews"},           "reports": False},
+        "announcements":    {"sentiment": False, "widget_subtypes": {"noticeNews"},                  "reports": False},
+        "market_analysis":  {"sentiment": False, "widget_subtypes": {"reportNews"},                  "reports": True},
+        "risk_check":       {"sentiment": True,  "widget_subtypes": {"news"},                        "reports": False, "benefit_type": -1},
+        "earnings":         {"sentiment": False, "widget_subtypes": {"news", "noticeNews"},          "reports": False},
+        "industry":         {"sentiment": False, "widget_subtypes": {"tradeNews"},                   "reports": False},
+    }
+
+    # ------------------------------------------------------------------
     # 聚合调度
     # ------------------------------------------------------------------
 
@@ -2689,10 +2723,21 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
         从查询字符串中提取 6 位股票代码，依次调用三个百度财经接口获取新闻，
         去重合并后返回。单个源失败不影响其他源。
+
+        支持 dimension 参数按维度精准选择数据子接口：
+        - latest_news: 个股新闻 + 快讯
+        - announcements: 公司公告
+        - market_analysis: 研报
+        - risk_check: 利空新闻
+        - earnings: 新闻 + 公告
+        - industry: 行业新闻
         """
         stock_code = self._extract_stock_code(query, **kwargs)
         if not stock_code:
             return self._empty_response(query, "BaiduFinance: 无法从查询中提取股票代码")
+
+        dimension = kwargs.get("dimension")
+        dim_cfg = self._DIMENSION_SOURCES.get(dimension) if dimension else None
 
         try:
             headers = self._build_headers()
@@ -2701,27 +2746,63 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             seen_titles: set = set()
             source_errors = 0
 
-            # 三个源各自独立，失败只 log 不阻断
-            sentiment = self._fetch_sentiment_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
-            if sentiment is None:
-                source_errors += 1
-            else:
-                self._merge_results(all_results, seen_titles, sentiment)
+            if dim_cfg:
+                # 按维度精准获取
+                if dim_cfg.get("sentiment"):
+                    benefit_type = dim_cfg.get("benefit_type")
+                    sentiment = self._fetch_sentiment_news(
+                        stock_code, self._PER_SOURCE_LIMIT, cutoff, headers,
+                        benefit_type=benefit_type,
+                    )
+                    if sentiment is None:
+                        source_errors += 1
+                    else:
+                        self._merge_results(all_results, seen_titles, sentiment)
 
-            widget = self._fetch_widget_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
-            if widget is None:
-                source_errors += 1
-            else:
-                self._merge_results(all_results, seen_titles, widget)
+                widget_subtypes = dim_cfg.get("widget_subtypes")
+                if widget_subtypes:
+                    widget = self._fetch_widget_news(
+                        stock_code, self._PER_SOURCE_LIMIT, cutoff, headers,
+                        subtypes=widget_subtypes,
+                    )
+                    if widget is None:
+                        source_errors += 1
+                    else:
+                        self._merge_results(all_results, seen_titles, widget)
 
-            reports = self._fetch_research_reports(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
-            if reports is None:
-                source_errors += 1
+                if dim_cfg.get("reports"):
+                    reports = self._fetch_research_reports(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
+                    if reports is None:
+                        source_errors += 1
+                    else:
+                        self._merge_results(all_results, seen_titles, reports)
             else:
-                self._merge_results(all_results, seen_titles, reports)
+                # 无 dimension — 保持原行为（全量获取）
+                sentiment = self._fetch_sentiment_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
+                if sentiment is None:
+                    source_errors += 1
+                else:
+                    self._merge_results(all_results, seen_titles, sentiment)
 
-            # 三个源全部异常 → success=False；部分或全部正常 → success=True
-            if source_errors >= 3:
+                widget = self._fetch_widget_news(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
+                if widget is None:
+                    source_errors += 1
+                else:
+                    self._merge_results(all_results, seen_titles, widget)
+
+                reports = self._fetch_research_reports(stock_code, self._PER_SOURCE_LIMIT, cutoff, headers)
+                if reports is None:
+                    source_errors += 1
+                else:
+                    self._merge_results(all_results, seen_titles, reports)
+
+            # 判断有效源数量（维度模式下可能只有一个源）
+            expected_sources = len([
+                s for s in ("sentiment", "widget_subtypes", "reports")
+                if dim_cfg.get(s)
+            ]) if dim_cfg else 3
+
+            if source_errors >= expected_sources:
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -3959,6 +4040,7 @@ class SearchService:
                     max_results=provider_max_results,
                     days=search_days,
                     stock_code=stock_code,
+                    dimension=dim['name'],
                 )
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
