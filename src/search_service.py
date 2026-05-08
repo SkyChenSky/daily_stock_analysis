@@ -2464,9 +2464,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
                     evaluate = item.get("evaluate", "")
                     content_items = (item.get("content") or {}).get("items") or []
-                    body = ""
-                    if content_items:
-                        body = content_items[0].get("data", "")
+                    body = "".join(ci.get("data", "") for ci in content_items)
 
                     snippet_parts = []
                     if evaluate:
@@ -4255,8 +4253,8 @@ class SearchService:
                     date_str = f" [{r.published_date}]" if r.published_date else ""
                     lines.append(f"  {i}. {r.title}{date_str}")
                     # 如果摘要太短，可能信息量不足
-                    snippet = r.snippet[:500] if len(r.snippet) > 20 else r.snippet
-                    lines.append(f"     {snippet}...")
+                    snippet = r.snippet[:1000] if len(r.snippet) > 20 else r.snippet
+                    lines.append(f"     {snippet}")
             else:
                 lines.append("  未找到相关信息")
         
