@@ -2329,17 +2329,21 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
         """
         results: List[SearchResult] = []
         try:
+            params = {
+                "market": "ab",
+                "code": stock_code,
+                "query": stock_code,
+                "financeType": "stock",
+                "pn": 0,
+                "rn": max_results * 2,
+            }
+            if benefit_type is not None:
+                params["benefitType"] = benefit_type
+
             resp = _get_with_retry(
                 self._BAIDU_API_URL,
                 headers=headers,
-                params={
-                    "market": "ab",
-                    "code": stock_code,
-                    "query": stock_code,
-                    "financeType": "stock",
-                    "pn": 0,
-                    "rn": max_results * 2,
-                },
+                params=params,
                 timeout=10,
             )
             resp.raise_for_status()
@@ -2354,10 +2358,6 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
 
             for item in result_list:
                 benefit = item.get("benefitType", 0)
-
-                # 按 benefit_type 过滤
-                if benefit_type is not None and benefit != benefit_type:
-                    continue
 
                 publish_time = item.get("publishTime", 0)
                 published_date = ""
@@ -4124,7 +4124,7 @@ class SearchService:
                     date_str = f" [{r.published_date}]" if r.published_date else ""
                     lines.append(f"  {i}. {r.title}{date_str}")
                     # 如果摘要太短，可能信息量不足
-                    snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
+                    snippet = r.snippet[:500] if len(r.snippet) > 20 else r.snippet
                     lines.append(f"     {snippet}...")
             else:
                 lines.append("  未找到相关信息")
