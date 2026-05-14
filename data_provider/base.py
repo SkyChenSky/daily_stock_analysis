@@ -2005,7 +2005,12 @@ class DataFetcherManager:
         from src.config import get_config
 
         config = get_config()
+        logger.info(
+            "[基本面] get_fundamental_context called for %s, pipeline_enabled=%s",
+            stock_code, config.enable_fundamental_pipeline,
+        )
         if not config.enable_fundamental_pipeline:
+            logger.warning("[基本面] fundamental pipeline disabled for %s, returning not_supported", stock_code)
             return self._build_market_not_supported(
                 market=_market_tag(stock_code),
                 reason="fundamental pipeline disabled",
