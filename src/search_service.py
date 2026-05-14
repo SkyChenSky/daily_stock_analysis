@@ -2349,6 +2349,10 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             resp.raise_for_status()
             data = resp.json()
 
+            if not isinstance(data, dict):
+                logger.warning("[BaiduFinance] sentiment API 返回非 dict: %s", type(data).__name__)
+                return None
+
             result_list = (
                 data.get("Result", [{}])[0]
                 .get("TplData", {})
@@ -2425,6 +2429,10 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             )
             resp.raise_for_status()
             payload = resp.json()
+
+            if not isinstance(payload, dict):
+                logger.warning("[BaiduFinance] widget API 返回非 dict: %s", type(payload).__name__)
+                return None
 
             # 实际响应路径: Result.content
             content = payload.get("Result", {}).get("content", {})
@@ -2589,7 +2597,7 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
                     ))
 
         except Exception as e:
-            logger.warning("[BaiduFinance] 组件新闻源失败: %s", e)
+            logger.warning("[BaiduFinance] 组件新闻源失败: %s: %s", type(e).__name__, e)
             return None
 
         return results
@@ -2624,6 +2632,10 @@ class BaiduFinanceSearchProvider(BaseSearchProvider):
             )
             resp.raise_for_status()
             payload = resp.json()
+
+            if not isinstance(payload, dict):
+                logger.warning("[BaiduFinance] reports API 返回非 dict: %s", type(payload).__name__)
+                return []
 
             report_list = (
                 payload.get("Result", [{}])[0]
