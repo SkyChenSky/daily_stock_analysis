@@ -2293,6 +2293,14 @@ class DataFetcherManager:
             result_ctx["status"] = "ok"
 
         result_ctx["elapsed_ms"] = int((time.time() - start_ts) * 1000)
+        logger.info(
+            "[基本面] %s fundamental_context 完成: status=%s, blocks={%s}, elapsed=%dms, errors=%s",
+            stock_code,
+            result_ctx.get("status"),
+            ", ".join(f"{k}={v}" for k, v in block_statuses.items()),
+            result_ctx["elapsed_ms"],
+            result_ctx.get("errors", [])[:5],
+        )
         if cache_ttl > 0 and self._should_cache_fundamental_context(result_ctx):
             with self._fundamental_cache_lock:
                 self._fundamental_cache[cache_key] = {

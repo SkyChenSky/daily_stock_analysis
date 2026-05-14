@@ -283,10 +283,13 @@ class AkshareFundamentalAdapter:
                 if isinstance(df, pd.Series):
                     df = df.to_frame().T
                 if isinstance(df, pd.DataFrame) and not df.empty:
+                    logger.debug("[adapter] %s(%s) → rows=%d", func_name, list(kwargs.keys()), len(df))
                     return df, func_name, errors
             except Exception as exc:
                 errors.append(f"{func_name}:{type(exc).__name__}")
+                logger.debug("[adapter] %s(%s) failed: %s: %s", func_name, kwargs, type(exc).__name__, exc)
                 continue
+        logger.debug("[adapter] all candidates failed for %s", [c[0] for c in candidates])
         return None, None, errors
 
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
@@ -411,6 +414,14 @@ class AkshareFundamentalAdapter:
 
         has_content = bool(result["growth"] or result["earnings"] or result["institution"])
         result["status"] = "partial" if has_content else "not_supported"
+        logger.info(
+            "[adapter] get_fundamental_bundle(%s): status=%s, growth=%s, earnings_keys=%s, institution=%s, errors=%s",
+            stock_code, result["status"],
+            bool(result["growth"]),
+            list(result["earnings"].keys()),
+            bool(result["institution"]),
+            result["errors"][:5],
+        )
         return result
 
     def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
@@ -468,6 +479,13 @@ class AkshareFundamentalAdapter:
 
         has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
         result["status"] = "partial" if has_content else "not_supported"
+        logger.info(
+            "[adapter] get_capital_flow(%s): status=%s, stock_flow=%s, sector_top=%d, errors=%s",
+            stock_code, result["status"],
+            bool(result["stock_flow"]),
+            len(result["sector_rankings"].get("top", [])),
+            result["errors"][:5],
+        )
         return result
 
     def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
