@@ -494,6 +494,10 @@ class StockAnalysisPipeline:
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
 
+            # Step 7.8: data_perspective programmatic pre-fill + discrepancy logging
+            if result and result.success:
+                self._prefill_data_perspective(result, enhanced_context, code)
+
             # Step 8: 保存分析历史记录
             if result and result.success:
                 try:
@@ -596,6 +600,10 @@ class StockAnalysisPipeline:
                 'trend_status': trend_result.trend_status.value,
                 'ma_alignment': trend_result.ma_alignment,
                 'trend_strength': trend_result.trend_strength,
+                'ma5': trend_result.ma5,
+                'ma10': trend_result.ma10,
+                'ma20': trend_result.ma20,
+                'current_price': trend_result.current_price,
                 'bias_ma5': trend_result.bias_ma5,
                 'bias_ma10': trend_result.bias_ma10,
                 'volume_status': trend_result.volume_status.value,
@@ -686,7 +694,220 @@ class StockAnalysisPipeline:
             )
         )
 
+        # Compute dimension scores and attach to context
+        enhanced["dimension_scores"] = self._compute_dimension_scores(enhanced, context.get("code", ""))
+
         return enhanced
+
+    def _prefill_data_perspective(
+        self,
+        result: Any,
+        enhanced_context: Dict[str, Any],
+        code: str,
+    ) -> None:
+        """Pre-fill dashboard.data_perspective with programmatic values.
+
+        If LLM already returned data_perspective, compare and log discrepancies.
+        Programmatic values are used as fallback when LLM fields are missing.
+        """
+        if not result or not hasattr(result, "dashboard") or not isinstance(result.dashboard, dict):
+            return
+
+        dashboard = result.dashboard
+        dp = dashboard.get("data_perspective")
+        if not isinstance(dp, dict):
+            dp = {}
+
+        trend = enhanced_context.get("trend_analysis") or {}
+        chip = enhanced_context.get("chip") or {}
+        realtime = enhanced_context.get("realtime") or {}
+
+        discrepancies = []
+
+        # --- trend_status ---
+        prog_trend = {
+            "ma_alignment": trend.get("ma_alignment", ""),
+            "is_bullish": trend.get("trend_status", "") in ("强势多头", "多头排列", "弱势多头"),
+            "trend_score": trend.get("signal_score", 0),
+        }
+        llm_trend = dp.get("trend_status", {})
+        if isinstance(llm_trend, dict):
+            if llm_trend.get("trend_score") is not None and prog_trend["trend_score"] != llm_trend.get("trend_score"):
+                discrepancies.append(f"trend_score: prog={prog_trend['trend_score']} llm={llm_trend.get('trend_score')}")
+        dp.setdefault("trend_status", {})
+        if isinstance(dp["trend_status"], dict):
+            for k, v in prog_trend.items():
+                if k not in dp["trend_status"] or dp["trend_status"][k] is None:
+                    dp["trend_status"][k] = v
+
+        # --- price_position ---
+        prog_price = {
+            "current_price": realtime.get("price") or trend.get("current_price"),
+            "ma5": trend.get("ma5"),
+            "ma10": trend.get("ma10"),
+            "ma20": trend.get("ma20"),
+            "bias_ma5": trend.get("bias_ma5"),
+        }
+        dp.setdefault("price_position", {})
+        if isinstance(dp["price_position"], dict):
+            for k, v in prog_price.items():
+                if k not in dp["price_position"] or dp["price_position"][k] is None:
+                    dp["price_position"][k] = v
+
+        # --- volume_analysis ---
+        vol_ratio = realtime.get("volume_ratio")
+        dp.setdefault("volume_analysis", {})
+        if isinstance(dp["volume_analysis"], dict):
+            if not dp["volume_analysis"].get("volume_ratio") and vol_ratio is not None:
+                dp["volume_analysis"]["volume_ratio"] = vol_ratio
+            if not dp["volume_analysis"].get("volume_status"):
+                dp["volume_analysis"]["volume_status"] = trend.get("volume_status", "")
+            if not dp["volume_analysis"].get("turnover_rate") and realtime.get("turnover_rate") is not None:
+                dp["volume_analysis"]["turnover_rate"] = realtime.get("turnover_rate")
+
+        # --- chip_structure ---
+        prog_chip = {
+            "profit_ratio": chip.get("profit_ratio"),
+            "avg_cost": chip.get("avg_cost"),
+            "concentration": chip.get("concentration_90"),
+            "chip_health": chip.get("chip_status"),
+        }
+        dp.setdefault("chip_structure", {})
+        if isinstance(dp["chip_structure"], dict):
+            for k, v in prog_chip.items():
+                if k not in dp["chip_structure"] or dp["chip_structure"][k] is None:
+                    dp["chip_structure"][k] = v
+
+        dashboard["data_perspective"] = dp
+
+        # Log discrepancies for future analysis
+        if discrepancies:
+            logger.info(
+                "%s data_perspective discrepancies: %s",
+                code, "; ".join(discrepances),
+            )
+
+        filled = sum(
+            1 for section in dp.values()
+            if isinstance(section, dict) for v in section.values() if v is not None
+        )
+        logger.debug("%s data_perspective pre-filled (%d fields)", code, filled)
+
+    def _compute_dimension_scores(self, enhanced: Dict[str, Any], code: str = "") -> Dict[str, Any]:
+        """Run all dimension scorers and return structured results."""
+        from src.scorers.chip_scorer import ChipScorer
+        from src.scorers.capital_flow_scorer import CapitalFlowScorer
+        from src.scorers.fundamental_scorer import FundamentalScorer
+
+        results: Dict[str, Any] = {"scores": {}, "checklist": [], "reference_score": None}
+
+        # Technical score — reuse existing signal_score from trend_analysis
+        trend = enhanced.get("trend_analysis")
+        if trend and isinstance(trend, dict):
+            tech_score = trend.get("signal_score", 0)
+            results["scores"]["technical"] = {
+                "dimension": "technical",
+                "score": tech_score,
+                "label": "技术面",
+                "status_label": "偏多" if tech_score >= 60 else ("中性" if tech_score >= 40 else "偏空"),
+                "reasons": trend.get("signal_reasons", []),
+                "risk_flags": trend.get("risk_factors", []),
+            }
+
+        # Chip score
+        try:
+            chip_result = ChipScorer().score(enhanced)
+            results["scores"]["chip"] = chip_result.to_dict()
+            results["scores"]["chip"]["label"] = chip_result.label
+            results["scores"]["chip"]["status_label"] = chip_result.status_label
+        except Exception as exc:
+            logger.debug("ChipScorer failed: %s", exc)
+
+        # Capital flow score
+        try:
+            cf_result = CapitalFlowScorer().score(enhanced)
+            results["scores"]["capital_flow"] = cf_result.to_dict()
+            results["scores"]["capital_flow"]["label"] = cf_result.label
+            results["scores"]["capital_flow"]["status_label"] = cf_result.status_label
+        except Exception as exc:
+            logger.debug("CapitalFlowScorer failed: %s", exc)
+
+        # Fundamental score
+        try:
+            fund_result = FundamentalScorer().score(enhanced)
+            results["scores"]["fundamental"] = fund_result.to_dict()
+            results["scores"]["fundamental"]["label"] = fund_result.label
+            results["scores"]["fundamental"]["status_label"] = fund_result.status_label
+        except Exception as exc:
+            logger.debug("FundamentalScorer failed: %s", exc)
+
+        # Checklist pre-judgments (programmatic items only)
+        checklist = []
+        if trend and isinstance(trend, dict):
+            trend_status = trend.get("trend_status", "")
+            if "多头" in trend_status:
+                checklist.append(("多头排列", True))
+            elif "空头" in trend_status:
+                checklist.append(("多头排列", False))
+            else:
+                checklist.append(("多头排列", None))
+
+            bias = trend.get("bias_ma5", 0)
+            if isinstance(bias, (int, float)):
+                bias = float(bias)
+                if -3 <= bias <= 5:
+                    checklist.append(("乖离率合理", True))
+                elif bias > 5:
+                    checklist.append(("乖离率合理", False))
+                else:
+                    checklist.append(("乖离率合理", None))
+
+            vol_status = trend.get("volume_status", "")
+            if vol_status in ("缩量回调", "放量上涨"):
+                checklist.append(("量能配合", True))
+            elif vol_status == "量能正常":
+                checklist.append(("量能配合", None))
+            elif vol_status == "放量下跌":
+                checklist.append(("量能配合", False))
+            else:
+                checklist.append(("量能配合", None))
+
+        chip_score_data = results["scores"].get("chip", {})
+        chip_score_val = chip_score_data.get("score")
+        if chip_score_val is not None:
+            checklist.append(("筹码健康", chip_score_val >= 60))
+        else:
+            checklist.append(("筹码健康", None))
+
+        # Items that require LLM judgment — mark as pending
+        checklist.append(("利空排查", None))  # requires news analysis
+        checklist.append(("估值合理", None))  # requires industry context
+
+        results["checklist"] = checklist
+
+        # Reference score: weighted average of available scores
+        weights = {"technical": 0.35, "chip": 0.15, "capital_flow": 0.25, "fundamental": 0.25}
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for dim, w in weights.items():
+            s = results["scores"].get(dim, {}).get("score")
+            if s is not None:
+                weighted_sum += float(s) * w
+                total_weight += w
+        if total_weight > 0:
+            results["reference_score"] = round(weighted_sum / total_weight, 1)
+        else:
+            tech_s = results["scores"].get("technical", {}).get("score", 50)
+            results["reference_score"] = tech_s
+
+        logger.info(
+            "%s dimension_scores: %s ref=%.1f",
+            code or "?",
+            {k: v.get("score") for k, v in results["scores"].items()},
+            results["reference_score"] or 0,
+        )
+
+        return results
 
     def _attach_belong_boards_to_fundamental_context(
         self,
@@ -776,6 +997,14 @@ class StockAnalysisPipeline:
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
 
+            # Build scorer context (same transformation as non-agent path)
+            # dimension_scores is computed inside _enhance_context automatically
+            scorer_ctx = self._enhance_context(
+                {"code": code}, realtime_quote, chip_data, trend_result,
+                stock_name, fundamental_context,
+            )
+            initial_context["dimension_scores"] = scorer_ctx.get("dimension_scores", {})
+
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
@@ -821,6 +1050,10 @@ class StockAnalysisPipeline:
             # price_position fallback (same as non-agent path Step 7.7)
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+
+            # data_perspective programmatic pre-fill (same as non-agent path)
+            if result and result.success:
+                self._prefill_data_perspective(result, scorer_ctx, code)
 
             resolved_stock_name = result.name if result and result.name else stock_name
 

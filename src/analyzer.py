@@ -1578,6 +1578,97 @@ class GeminiAnalyzer:
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
 """
 
+        # Display previously fetched fundamental data blocks (growth, capital_flow,
+        # institution, dragon_tiger) that were never shown to the LLM
+        if isinstance(fundamental_context, dict):
+            # 成长性指标（growth block）
+            growth_block = fundamental_context.get("growth", {})
+            growth_data = growth_block.get("data", {}) if isinstance(growth_block, dict) else {}
+            growth_status = growth_block.get("status", "not_supported") if isinstance(growth_block, dict) else "not_supported"
+            if growth_status not in ("not_supported", "failed") and isinstance(growth_data, dict) and growth_data:
+                rev_yoy = growth_data.get("revenue_yoy")
+                profit_yoy = growth_data.get("net_profit_yoy")
+                roe_val = growth_data.get("roe")
+                gm = growth_data.get("gross_margin")
+                has_any = any(v is not None for v in (rev_yoy, profit_yoy, roe_val, gm))
+                if has_any:
+                    prompt += (
+                        "\n### 成长性指标\n"
+                        "| 指标 | 数值 | 参考标准 |\n"
+                        "|------|------|----------|\n"
+                        f"| 营收同比增长 | {self._format_percent(rev_yoy)} | >20%高增长 |\n"
+                        f"| 净利润同比增长 | {self._format_percent(profit_yoy)} | >20%高增长 |\n"
+                        f"| ROE | {self._format_percent(roe_val)} | >15%优秀 |\n"
+                        f"| 毛利率 | {self._format_percent(gm)} | 行业间差异大 |\n"
+                    )
+
+            # 资金流向（capital_flow block）
+            cf_block = fundamental_context.get("capital_flow", {})
+            cf_data = cf_block.get("data", {}) if isinstance(cf_block, dict) else {}
+            cf_status = cf_block.get("status", "not_supported") if isinstance(cf_block, dict) else "not_supported"
+            if cf_status not in ("not_supported", "failed") and isinstance(cf_data, dict) and cf_data:
+                stock_flow = cf_data.get("stock_flow", {})
+                sector_rank = cf_data.get("sector_rankings", {})
+                sf_has = isinstance(stock_flow, dict) and any(
+                    stock_flow.get(k) is not None for k in ("main_net_inflow", "inflow_5d", "inflow_10d")
+                )
+                if sf_has:
+                    net_inflow = stock_flow.get("main_net_inflow")
+                    flow_5d = stock_flow.get("inflow_5d")
+                    flow_10d = stock_flow.get("inflow_10d")
+                    prompt += (
+                        "\n### 资金流向\n"
+                        "| 指标 | 数值 | 说明 |\n"
+                        "|------|------|------|\n"
+                        f"| 主力净流入 | {self._format_amount(net_inflow)} | 正值为流入 |\n"
+                        f"| 5日资金趋势 | {self._format_amount(flow_5d)} | 连续流入为强 |\n"
+                        f"| 10日资金趋势 | {self._format_amount(flow_10d)} | 中期资金方向 |\n"
+                    )
+                # 板块资金流向（仅展示前3）
+                if isinstance(sector_rank, dict):
+                    top_sectors = sector_rank.get("top", [])
+                    if isinstance(top_sectors, list) and top_sectors:
+                        top3 = top_sectors[:3]
+                        sector_lines = ", ".join(
+                            s.get("name", "?") for s in top3 if isinstance(s, dict)
+                        )
+                        if sector_lines:
+                            prompt += f"资金流入前三板块：{sector_lines}\n"
+
+            # 机构与龙虎（institution + dragon_tiger blocks）
+            inst_block = fundamental_context.get("institution", {})
+            inst_data = inst_block.get("data", {}) if isinstance(inst_block, dict) else {}
+            inst_status = inst_block.get("status", "not_supported") if isinstance(inst_block, dict) else "not_supported"
+
+            dt_block = fundamental_context.get("dragon_tiger", {})
+            dt_data = dt_block.get("data", {}) if isinstance(dt_block, dict) else {}
+            dt_status = dt_block.get("status", "not_supported") if isinstance(dt_block, dict) else "not_supported"
+
+            inst_has_data = inst_status not in ("not_supported", "failed") and isinstance(inst_data, dict) and any(
+                inst_data.get(k) is not None for k in ("institution_holding_change", "top10_holder_change")
+            )
+            dt_has_data = dt_status not in ("not_supported", "failed") and isinstance(dt_data, dict) and dt_data.get("is_on_list") is not None
+
+            if inst_has_data or dt_has_data:
+                prompt += "\n### 机构与龙虎\n"
+                if inst_has_data:
+                    inst_change = inst_data.get("institution_holding_change")
+                    top10_change = inst_data.get("top10_holder_change")
+                    prompt += "| 指标 | 数值 |\n|------|------|\n"
+                    if inst_change is not None:
+                        prompt += f"| 机构持仓变化 | {inst_change} |\n"
+                    if top10_change is not None:
+                        prompt += f"| 十大股东变化 | {top10_change} |\n"
+                if dt_has_data:
+                    is_on_list = dt_data.get("is_on_list", False)
+                    recent_count = dt_data.get("recent_count", 0)
+                    latest_dt = dt_data.get("latest_date")
+                    dt_label = "是" if is_on_list else "否"
+                    prompt += f"| 近期上龙虎榜 | {dt_label}（近20日{recent_count}次）"
+                    if latest_dt:
+                        prompt += f"，最近{latest_dt}"
+                    prompt += " |\n"
+
         # 添加筹码分布数据
         if 'chip' in context:
             chip = context['chip']
@@ -1592,7 +1683,47 @@ class GeminiAnalyzer:
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
 """
-        
+
+        # Programmatic pre-evaluation: dimension scores, checklist, and reference score
+        dim_scores = context.get("dimension_scores", {})
+        if isinstance(dim_scores, dict) and dim_scores.get("scores"):
+            scores_map = dim_scores.get("scores", {})
+            if isinstance(scores_map, dict) and scores_map:
+                prompt += "\n## ⚡ 程序化预评估（供参考，你可以在最终结论中覆盖）\n\n"
+                prompt += "| 维度 | 评分 | 状态 |\n|------|------|------|\n"
+                for dim_key in ("technical", "chip", "capital_flow", "fundamental"):
+                    ds = scores_map.get(dim_key)
+                    if not isinstance(ds, dict):
+                        continue
+                    score_val = ds.get("score")
+                    label = ds.get("label", dim_key)
+                    status = ds.get("status_label", "")
+                    score_str = f"{score_val:.0f}/100" if isinstance(score_val, (int, float)) else "数据缺失"
+                    prompt += f"| {label} | {score_str} | {status} |\n"
+
+                # Checklist pre-judgments
+                checklist = dim_scores.get("checklist", [])
+                if isinstance(checklist, list) and checklist:
+                    prompt += "\n### 检查清单预判\n"
+                    for item in checklist:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            name, passed = item[0], item[1]
+                            if passed is True:
+                                prompt += f"✅ {name}\n"
+                            elif passed is False:
+                                prompt += f"❌ {name}\n"
+                            else:
+                                prompt += f"⬜ {name}（待判）\n"
+
+                ref_score = dim_scores.get("reference_score")
+                if isinstance(ref_score, (int, float)):
+                    prompt += f"\n综合参考分：{ref_score:.0f}/100\n"
+
+                prompt += (
+                    "\n> 以上为程序化参考，请结合新闻情报做出最终判断。"
+                    "遇重大事件（黑天鹅/重大利好）可大幅偏离参考分。\n"
+                )
+
         # 添加趋势分析结果（仅隐式内建 bull_trend 默认回退保留旧口径）
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
