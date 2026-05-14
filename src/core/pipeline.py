@@ -784,7 +784,7 @@ class StockAnalysisPipeline:
         if discrepancies:
             logger.info(
                 "%s data_perspective discrepancies: %s",
-                code, "; ".join(discrepances),
+                code, "; ".join(discrepancies),
             )
 
         filled = sum(
