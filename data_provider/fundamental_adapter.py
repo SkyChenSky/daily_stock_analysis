@@ -344,9 +344,7 @@ class AkshareFundamentalAdapter:
 
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
             ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
             ("stock_yjbb_em", {}),
         ])
         result["errors"].extend(forecast_errors)
@@ -360,7 +358,6 @@ class AkshareFundamentalAdapter:
 
         # Earnings quick report
         quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
             ("stock_yjkb_em", {}),
         ])
         result["errors"].extend(quick_errors)
@@ -399,9 +396,7 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"institution:{inst_source}")
 
         top10_df, top10_source, top10_errors = self._call_df_candidates([
-            ("stock_gdfx_top_10_em", {"symbol": stock_code}),
             ("stock_gdfx_top_10_em", {}),
-            ("stock_zh_a_gdhs_detail_em", {"symbol": stock_code}),
             ("stock_zh_a_gdhs_detail_em", {}),
         ])
         result["errors"].extend(top10_errors)

@@ -99,12 +99,24 @@ class MootdxFundamentalAdapter:
         self._available = False
         self._init_error: Optional[str] = None
         try:
-            from mootdx.affair import Affair  # noqa: F401
+            from mootdx.affair import Affair
+            # Lightweight pre-check: verify Affair can reach TDX servers.
+            # This catches "IP Address bad" early instead of failing on every stock.
+            try:
+                files = Affair.files()
+                if not files:
+                    logger.warning("[mootdx] Affair.files() returned empty, adapter disabled")
+                    self._init_error = "Affair.files() empty"
+                    return
+            except Exception as pre_exc:
+                logger.warning("[mootdx] Affair pre-check failed: %s, adapter disabled", pre_exc)
+                self._init_error = str(pre_exc)
+                return
             self._available = True
             logger.info("[mootdx] adapter initialised, tdx_dir=%s", tdx_dir or "<auto>")
         except ImportError as exc:
             self._init_error = str(exc)
-            logger.warning("[mootdx] mootdx not installed, adapter disabled: %s", exc)
+            logger.info("[mootdx] mootdx not installed, adapter disabled: %s", exc)
         except Exception as exc:
             self._init_error = str(exc)
             logger.warning("[mootdx] initialisation failed: %s", exc)
