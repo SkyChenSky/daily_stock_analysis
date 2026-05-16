@@ -711,6 +711,10 @@ class Config:
     # 基本面缓存最大条目数（避免长时间运行内存增长）
     fundamental_cache_max_entries: int = 256
 
+    # === mootdx 通达信财务数据 fallback（可选）===
+    enable_mootdx_fundamental: bool = True
+    mootdx_tdx_dir: str = ""              # 通达信数据目录（空则自动下载）
+
     # === Portfolio PR2: import/risk/fx settings ===
     portfolio_risk_concentration_alert_pct: float = 35.0
     portfolio_risk_drawdown_alert_pct: float = 15.0
@@ -1411,6 +1415,11 @@ class Config:
                 field_name='FUNDAMENTAL_CACHE_MAX_ENTRIES',
                 minimum=1,
             ),
+            enable_mootdx_fundamental=parse_env_bool(
+                os.getenv('ENABLE_MOOTDX_FUNDAMENTAL'),
+                True,
+            ),
+            mootdx_tdx_dir=os.getenv('MOOTDX_TDX_DIR', ''),
             portfolio_risk_concentration_alert_pct=parse_env_float(
                 os.getenv('PORTFOLIO_RISK_CONCENTRATION_ALERT_PCT'),
                 35.0,

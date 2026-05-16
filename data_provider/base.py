@@ -468,6 +468,120 @@ class BaseFetcher(ABC):
         time.sleep(sleep_time)
 
 
+class _CompositeFundamentalAdapter:
+    """Composite adapter: AkShare (primary) → mootdx (fallback).
+
+    When the primary adapter returns failed/partial data for
+    get_fundamental_bundle, the fallback adapter fills in missing
+    fields.  capital_flow and dragon_tiger are always delegated to
+    AkShare only (mootdx does not support them).
+    """
+
+    def __init__(self, primary: Any, fallback: Optional[Any] = None):
+        self._primary = primary
+        self._fallback = fallback
+
+    # -- public API (mirrors AkshareFundamentalAdapter) --
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        result = self._invoke_primary("get_fundamental_bundle", stock_code)
+        if self._fallback is None:
+            return result
+
+        status = str(result.get("status", "not_supported")) if isinstance(result, dict) else "failed"
+        if status in ("ok", "not_supported"):
+            return result
+
+        # primary is failed/partial — try fallback
+        fb = self._invoke_fallback("get_fundamental_bundle", stock_code)
+        if fb is None:
+            return result
+        return self._merge_bundles(result, fb)
+
+    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+        return getattr(self._primary, "get_capital_flow")(stock_code, top_n)
+
+    def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
+        return getattr(self._primary, "get_dragon_tiger_flag")(stock_code, lookback_days)
+
+    # -- helpers --
+
+    def _invoke_primary(self, method: str, *args: Any) -> Dict[str, Any]:
+        try:
+            return getattr(self._primary, method)(*args)
+        except Exception as exc:
+            logger.warning("[composite] primary %s failed: %s", method, exc)
+            return {"status": "failed", "source_chain": [], "errors": [str(exc)]}
+
+    def _invoke_fallback(self, method: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if self._fallback is None:
+            return None
+        try:
+            return getattr(self._fallback, method)(*args)
+        except Exception as exc:
+            logger.debug("[composite] fallback %s failed: %s", method, exc)
+            return None
+
+    @staticmethod
+    def _has_real_content(section: Any) -> bool:
+        """Check if a section dict has at least one non-None value (recursively for sub-dicts)."""
+        if not isinstance(section, dict) or not section:
+            return False
+        for val in section.values():
+            if val is None:
+                continue
+            if isinstance(val, dict):
+                if _CompositeFundamentalAdapter._has_real_content(val):
+                    return True
+            else:
+                return True
+        return False
+
+    @staticmethod
+    def _merge_bundles(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge fallback into primary for growth and earnings fields.
+
+        Primary non-None values always take precedence over fallback.
+        """
+        merged = dict(primary)
+
+        for section in ("growth", "earnings", "institution"):
+            p_sec = merged.get(section) or {}
+            f_sec = fallback.get(section) or {}
+            if not isinstance(p_sec, dict):
+                p_sec = {}
+            if not isinstance(f_sec, dict):
+                continue
+            merged_sec = dict(p_sec)
+            for key, val in f_sec.items():
+                # Only fill when primary has no real content for this key
+                if key not in merged_sec or not _CompositeFundamentalAdapter._has_real_content(merged_sec[key]):
+                    merged_sec[key] = val
+            merged[section] = merged_sec
+
+        # Merge source chains
+        p_chain = merged.get("source_chain") or []
+        f_chain = fallback.get("source_chain") or []
+        merged["source_chain"] = list(p_chain) + list(f_chain)
+
+        # Merge errors
+        p_err = merged.get("errors") or []
+        f_err = fallback.get("errors") or []
+        merged["errors"] = list(p_err) + list(f_err)
+
+        # Recalculate status based on actual content (not empty dicts)
+        has_growth = _CompositeFundamentalAdapter._has_real_content(merged.get("growth"))
+        has_earnings = _CompositeFundamentalAdapter._has_real_content(merged.get("earnings"))
+        if has_growth and has_earnings:
+            merged["status"] = "ok"
+        elif has_growth or has_earnings:
+            merged["status"] = "partial"
+        else:
+            merged["status"] = primary.get("status", "failed")
+
+        return merged
+
+
 class DataFetcherManager:
     """
     数据源策略管理器
@@ -503,7 +617,7 @@ class DataFetcherManager:
         else:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
-        self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._fundamental_adapter = self._build_fundamental_adapter_chain()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -524,6 +638,34 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+
+    def _build_fundamental_adapter_chain(self) -> Any:
+        """Build the fundamental adapter chain: AkShare primary + optional mootdx fallback."""
+        primary = AkshareFundamentalAdapter()
+
+        from src.config import get_config
+        config = get_config()
+        if not config.enable_mootdx_fundamental:
+            return primary
+
+        # Conditional mootdx fallback
+        fallback = None
+        try:
+            from .mootdx_fundamental_adapter import MootdxFundamentalAdapter
+            fallback = MootdxFundamentalAdapter(
+                tdx_dir=config.mootdx_tdx_dir,
+            )
+            if not fallback.available:
+                logger.info("[composite] mootdx adapter disabled (library unavailable)")
+                fallback = None
+        except ImportError:
+            logger.info("[composite] mootdx not installed, fallback disabled")
+        except Exception as exc:
+            logger.warning("[composite] mootdx adapter init error: %s", exc)
+
+        if fallback is None:
+            return primary
+        return _CompositeFundamentalAdapter(primary, fallback)
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
